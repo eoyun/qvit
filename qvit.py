@@ -44,9 +44,6 @@ import math
 #        return x
 
 class AddClsPos(nn.Module):
-    """
-    입력 토큰에 [CLS] 토큰을 붙이고, 위치 임베딩을 더한다.
-    """
     def __init__(self, n_patches=196, embed_dim=16):
         super().__init__()
         self.cls = nn.Parameter(torch.zeros(1, 1, embed_dim))
