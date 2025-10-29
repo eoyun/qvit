@@ -4,6 +4,25 @@ import torch.nn as nn
 import pennylane as qml
 
 import numpy as np
+# ===== profiling utils (add near imports) =====
+import time
+import os
+
+PROFILE_QVIT = os.environ.get("QVIT_PROFILE", "0") in ("1", "true", "True")
+
+class Timer:
+    def __init__(self, name, enabled=True):
+        self.name = name
+        self.enabled = enabled
+    def __enter__(self):
+        if self.enabled:
+            self.t0 = time.perf_counter()
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        if self.enabled:
+            dt = time.perf_counter() - self.t0
+            print(f"[QVIT] {self.name}: {dt:.4f}s")
+
 
 class PatchEmbedding(nn.Module):
     def __init__(self, image_size=98, patch_size=7, in_channels=3, embed_dim=16):
@@ -62,7 +81,7 @@ class AddClsPos(nn.Module):
 import torch.nn.functional as F
 
 class MultiHeadAttentionBase(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.1, mask=None, use_bias=False):
+    def __init__(self, embed_dim, num_heads, dropout=0.0, mask=None, use_bias=False):
         super().__init__()
         assert embed_dim % num_heads == 0, \
             f"Embedding dim ({embed_dim}) must be divisible by number of heads ({num_heads})"
@@ -106,7 +125,7 @@ class MultiHeadAttentionBase(nn.Module):
         raise NotImplementedError("Base class - use a concrete implementation")
 
 class MultiHeadAttentionClassical(MultiHeadAttentionBase):
-    def __init__(self, embed_dim, num_heads, dropout=0.1, mask=None, use_bias=False):
+    def __init__(self, embed_dim, num_heads, dropout=0.0, mask=None, use_bias=False):
         super().__init__(embed_dim, num_heads, dropout, mask, use_bias)
         # Linear projection layers for Q, K, V and output:contentReference[oaicite:29]{index=29}
         self.q_linear = nn.Linear(embed_dim, embed_dim, bias=use_bias)
@@ -131,7 +150,7 @@ class MultiHeadAttentionClassical(MultiHeadAttentionBase):
         return self.combine_heads(context)
 
 class MultiHeadAttentionQuantum(MultiHeadAttentionBase):
-    def __init__(self, embed_dim, num_heads, dropout=0.1, mask=None, use_bias=False,
+    def __init__(self, embed_dim, num_heads, dropout=0.0, mask=None, use_bias=False,
                  n_qubits=4, n_qlayers=1, q_device="default.qubit"):
         super().__init__(embed_dim, num_heads, dropout, mask, use_bias)
         # Quantum setup: embed_dim must match n_qubits:contentReference[oaicite:31]{index=31}
@@ -142,6 +161,8 @@ class MultiHeadAttentionQuantum(MultiHeadAttentionBase):
             self.dev = qml.device(q_device, wires=n_qubits, shots=None, gpu=True)
         elif 'braket' in q_device:
             self.dev = qml.device(q_device, wires=n_qubits, shots=None, parallel=True)
+        elif q_device == 'lightning.gpu' :
+            self.dev = qml.device(q_device, wires=n_qubits, shots=None)
         else:
             self.dev = qml.device(q_device, wires=n_qubits, shots=None)
         # Define quantum circuit for linear layer (angle embedding + entanglers):contentReference[oaicite:32]{index=32}
@@ -149,7 +170,7 @@ class MultiHeadAttentionQuantum(MultiHeadAttentionBase):
             qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
             qml.templates.BasicEntanglerLayers(weights, wires=range(n_qubits))
             return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
-        self.qlayer = qml.QNode(circuit, self.dev, interface="torch")
+        self.qlayer = qml.QNode(circuit, self.dev, interface="torch",diff_method = "adjoint")
         # Define trainable weight shapes for the quantum layer (for n_qlayers of entanglers)
         self.weight_shapes = {"weights": (n_qlayers, n_qubits)}
         # Construct quantum layers acting like linear projections:contentReference[oaicite:33]{index=33}
@@ -157,44 +178,65 @@ class MultiHeadAttentionQuantum(MultiHeadAttentionBase):
         self.k_linear = qml.qnn.TorchLayer(self.qlayer, self.weight_shapes)
         self.v_linear = qml.qnn.TorchLayer(self.qlayer, self.weight_shapes)
         self.combine_heads = qml.qnn.TorchLayer(self.qlayer, self.weight_shapes)
+    def _eval_q_layer_single(self, layer, x2d: torch.Tensor) -> torch.Tensor:
+        # x2d: (N, E) on CPU (device of qnode)
+        y = layer(x2d)  # <-- 여기서 단 1회 호출
+        if isinstance(y, (list, tuple)):
+            y = torch.stack([torch.as_tensor(t) for t in y], dim=0)
+        return torch.as_tensor(y, dtype=x2d.dtype, device=x2d.device)
+
     def forward(self, x, mask=None):
-        # x shape: (batch, seq_len, embed_dim)
-        batch_size, seq_len, embed_dim = x.size()
-        assert embed_dim == self.embed_dim
-        # Apply the quantum "linear" layer to each time step for Q, K, V
-        #Q_seq = [self.q_linear(x[:, t, :]) for t in range(seq_len)]
-        #K_seq = [self.k_linear(x[:, t, :]) for t in range(seq_len)]
-        #V_seq = [self.v_linear(x[:, t, :]) for t in range(seq_len)]
-                # Quantum layers must avoid autocast(half) → disable just around them
-        from torch.amp import autocast
-        with autocast('cuda', enabled=False):
-            x32 = x.float()  # 양자 입력은 항상 float32
-            Q_seq = [self.q_linear(x32[:, t, :]).float() for t in range(seq_len)]
-            K_seq = [self.k_linear(x32[:, t, :]).float() for t in range(seq_len)]
-            V_seq = [self.v_linear(x32[:, t, :]).float() for t in range(seq_len)]
-        # Stack lists into tensors of shape (batch, seq_len, embed_dim)
-        Q = torch.stack(Q_seq, dim=1)
-        K = torch.stack(K_seq, dim=1)
-        V = torch.stack(V_seq, dim=1)
-        # Compute attention on these quantum-projected Q, K, V
-        context = self.downstream(
-            self.separate_heads(Q),
-            self.separate_heads(K),
-            self.separate_heads(V),
-            batch_size, mask
-        )
-        # Apply the output quantum linear to each time step of context
-        #out_seq = [self.combine_heads(context[:, t, :]) for t in range(context.size(1))]
-                # Output projection(quantum)도 autocast 끄고 float32 유지
-        with autocast('cuda', enabled=False):
-            ctx32 = context.float()
-            out_seq = [self.combine_heads(ctx32[:, t, :]).float() for t in range(ctx32.size(1))]
-        output = torch.stack(out_seq, dim=1)  # (batch, seq_len, embed_dim)
-        #return output
-        return output.to(x.dtype)
+        """
+        x: (B, S, E) on CUDA (혹은 CPU)
+        microbatch: QNode 메모리 제약 있을 때 (예: 256) 등으로 나눠 실행
+        """
+        B, S, E = x.shape
+        model_dev = x.device
+        cpu = torch.device("cpu")
+    
+        # (1) 한번에 CPU로 옮기고 (B*S, E)로 전개
+        with Timer("MHAQ::pre_move", PROFILE_QVIT):        
+            x_cpu = x.to(cpu)
+            xs = x_cpu.reshape(B * S, E)                      # (N=BS, E)
+    
+            # (2) Q/K/V: batched QNode 호출 (지원되면 1회, 아니면 자동 fallback)
+        with Timer("MHAQ::QKV", PROFILE_QVIT):        
+            t0 = time.perf_counter()
+            Qs = self._eval_q_layer_single(self.q_linear, xs)  # (N, E) on CPU
+            t1 = time.perf_counter()
+            Ks = self._eval_q_layer_single(self.k_linear, xs)
+            t2 = time.perf_counter()
+            Vs = self._eval_q_layer_single(self.v_linear, xs)
+            t3 = time.perf_counter()
+            if PROFILE_QVIT:
+                print(f"[QVIT]   Q-call: {t1 - t0:.4f}s | K-call: {t2 - t1:.4f}s | V-call: {t3 - t2:.4f}s")
+    
+            # (3) 다시 (B, S, E)로 접고 원래 디바이스로 복귀
+        with Timer("MHAQ::post_move_QKV", PROFILE_QVIT):        
+            Q = Qs.view(B, S, E).to(model_dev)
+            K = Ks.view(B, S, E).to(model_dev)
+            V = Vs.view(B, S, E).to(model_dev)
+    
+            # (4) 클래식 어텐션 (GPU에서 빠르게)
+        with Timer("MHAQ::attention_core", PROFILE_QVIT):        
+            context = self.downstream(
+                self.separate_heads(Q),
+                self.separate_heads(K),
+                self.separate_heads(V),
+                B, mask
+            )
+    
+            # (5) Combine도 batched 호출
+        with Timer("MHAQ::combine", PROFILE_QVIT):        
+            ctx_cpu = context.to(cpu).reshape(B * S, E)       # (N, E) CPU
+            Os = self._eval_q_layer_single(self.combine_heads, ctx_cpu)  # (N, E) CPU
+        with Timer("MHAQ::final_move", PROFILE_QVIT):        
+            output = Os.view(B, S, E).to(model_dev)
+        return output
+
 
 class FeedForwardBase(nn.Module):
-    def __init__(self, embed_dim, ffn_dim, dropout=0.1):
+    def __init__(self, embed_dim, ffn_dim, dropout=0.0):
         super().__init__()
         # Two linear layers: input -> hidden (ffn_dim), and hidden -> output (embed_dim)
         self.linear1 = nn.Linear(embed_dim, ffn_dim)
@@ -204,7 +246,7 @@ class FeedForwardBase(nn.Module):
         raise NotImplementedError("Base FFN class")
 
 class FeedForwardClassical(FeedForwardBase):
-    def __init__(self, embed_dim, ffn_dim, dropout=0.1):
+    def __init__(self, embed_dim, ffn_dim, dropout=0.0):
         super().__init__(embed_dim, ffn_dim, dropout)
     def forward(self, x):
         # x shape: (batch, seq_len, embed_dim)
@@ -214,7 +256,7 @@ class FeedForwardClassical(FeedForwardBase):
         return x
 
 class FeedForwardQuantum(FeedForwardBase):
-    def __init__(self, embed_dim, n_qubits, n_qlayers=1, dropout=0.1, q_device="default.qubit"):
+    def __init__(self, embed_dim, n_qubits, n_qlayers=1, dropout=0.0, q_device="default.qubit"):
         # Note: here ffn_dim is effectively n_qubits (size of quantum hidden layer)
         super().__init__(embed_dim, ffn_dim=n_qubits, dropout=dropout)
         # Set up quantum device for FFN (similar to attention)
@@ -222,31 +264,59 @@ class FeedForwardQuantum(FeedForwardBase):
             self.dev = qml.device(q_device, wires=n_qubits, gpu=True)
         elif 'braket' in q_device:
             self.dev = qml.device(q_device, wires=n_qubits, parallel=True)
+        elif q_device == 'lightning.gpu' :
+            self.dev = qml.device(q_device, wires=n_qubits)
         else:
             self.dev = qml.device(q_device, wires=n_qubits)
         def circuit(inputs, weights):
             qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
             qml.templates.BasicEntanglerLayers(weights, wires=range(n_qubits))
             return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
-        self.qlayer = qml.QNode(circuit, self.dev, interface="torch")
+        self.qlayer = qml.QNode(circuit, self.dev, interface="torch", diff_method = "adjoint")
         self.weight_shapes = {"weights": (n_qlayers, n_qubits)}
         # Quantum layer for the feed-forward "activation":contentReference[oaicite:37]{index=37}
         self.vqc = qml.qnn.TorchLayer(self.qlayer, self.weight_shapes)
-    def forward(self, x):
-        # x shape: (batch, seq_len, embed_dim)
-        batch_size, seq_len, _ = x.size()
-        x = self.linear1(x)  # project down to n_qubits
-        # Apply quantum layer to each token position:contentReference[oaicite:38]{index=38}
-        out_seq = [self.vqc(x[:, t, :]) for t in range(seq_len)]
-        # Stack back to (batch, seq_len, n_qubits)
-        x_q = torch.stack(out_seq, dim=1)
-        # Project back to embed_dim
-        x = self.linear2(x_q)
-        return x
+        # 양자 경로 기본 디바이스: CPU (안전/호환성↑)
+        self._qdev = torch.device("cpu")
+        self.vqc.to(self._qdev)
+    # ── batched 호출 시도 → 실패 시 per-sample fallback ──
+    def _eval_q_layer_single(self, layer, x2d: torch.Tensor) -> torch.Tensor:
+        # x2d: (N, E) on CPU (device of qnode)
+        y = layer(x2d)  # <-- 여기서 단 1회 호출
+        if isinstance(y, (list, tuple)):
+            y = torch.stack([torch.as_tensor(t) for t in y], dim=0)
+        return torch.as_tensor(y, dtype=x2d.dtype, device=x2d.device)
 
+    def forward(self, x):
+        """
+        x: (B, S, E)  (모델 입력 디바이스: 보통 CUDA)
+        1) Linear1 (GPU)
+        2) (B·S,E)로 전개 → CPU에서 batched VQC 실행 (또는 fallback)
+        3) (B,S,E) 복원 → Linear2 (GPU)
+        """
+        B, S, E = x.shape
+        model_dev = x.device
+        cpu = self._qdev
+
+        with Timer("FFNQ::linear1", PROFILE_QVIT):        
+            # 1) 클래식 1층 (GPU/모델 디바이스)
+            x = self.linear1(x)                    # (B, S, n_qubits)
+
+            # 2) CPU로 한 번에 이동 + (B·S,E)로 전개 → VQC batched 호출
+        with Timer("FFNQ::pre_move", PROFILE_QVIT):        
+            x_cpu = x.to(cpu).reshape(B * S, -1)   # (N, E)
+        with Timer("FFNQ::vqc", PROFILE_QVIT):        
+            z_cpu = self._eval_q_layer_single(self.vqc, x_cpu)  # (N, E) on CPU
+
+            # 3) (B,S,E) 복원 → 원래 디바이스로 복귀 → Linear2
+        with Timer("FFNQ::post_move", PROFILE_QVIT):        
+            z = z_cpu.view(B, S, -1).to(model_dev) # (B, S, n_qubits)
+        with Timer("FFNQ::linear2", PROFILE_QVIT):        
+            out = self.linear2(z)                  # (B, S, embed_dim)
+        return out
 
 class ViTBlockBase(nn.Module):
-    def __init__(self, embed_dim, num_heads, ffn_dim, dropout=0.1):
+    def __init__(self, embed_dim, num_heads, ffn_dim, dropout=0.0):
         super().__init__()
         # LayerNorm and dropout for post-attention and post-FFN
         self.norm1 = nn.LayerNorm(embed_dim)
@@ -270,23 +340,28 @@ class ViTBlockBase(nn.Module):
         return x
 
 class ViTBlockClassical(ViTBlockBase):
-    def __init__(self, embed_dim, num_heads, ffn_dim, dropout=0.1):
+    def __init__(self, embed_dim, num_heads, ffn_dim, n_qlayers, n_qubits_ffn, q_device, dropout=0.0):
         super().__init__(embed_dim, num_heads, ffn_dim, dropout)
         # Classical attention and FFN
         self.attn = MultiHeadAttentionClassical(embed_dim, num_heads, dropout=dropout)
-        self.ffn = FeedForwardClassical(embed_dim, ffn_dim, dropout=dropout)
+        # Quantum or classical FFN depending on n_qubits_ffn
+        if n_qubits_ffn > 0:
+            self.ffn = FeedForwardQuantum(embed_dim, n_qubits=n_qubits_ffn,
+                                          n_qlayers=n_qlayers, dropout=dropout, q_device=q_device)
+        else:
+            self.ffn = FeedForwardClassical(embed_dim, ffn_dim, dropout=dropout)
 
 class ViTBlockQuantum(ViTBlockBase):
     def __init__(self, embed_dim, num_heads, ffn_dim,
                  n_qubits_transformer, n_qubits_ffn,
-                 n_qlayers=1, dropout=0.1, q_device="default.qubit"):
+                 n_qlayers=1, dropout=0.0, q_device="default.qubit"):
         super().__init__(embed_dim, num_heads, ffn_dim, dropout)
         # Quantum multi-head attention (embed_dim must == n_qubits_transformer)
         self.attn = MultiHeadAttentionQuantum(embed_dim, num_heads, dropout=dropout,
                                               n_qubits=n_qubits_transformer,
                                               n_qlayers=n_qlayers, q_device=q_device)
         # Quantum or classical FFN depending on n_qubits_ffn
-        if n_qubits_ffn and n_qubits_ffn > 0:
+        if n_qubits_ffn > 0:
             self.ffn = FeedForwardQuantum(embed_dim, n_qubits=n_qubits_ffn,
                                           n_qlayers=n_qlayers, dropout=dropout, q_device=q_device)
         else:
@@ -298,7 +373,7 @@ class VisionTransformer(nn.Module):
                  embed_dim=16, num_heads=2, num_blocks=2, num_classes=10,
                  ffn_dim=32,
                  n_qubits_transformer=0, n_qubits_ffn=0, n_qlayers=1,
-                 dropout=0.1, q_device="default.qubit"):
+                 dropout=0.0, q_device="default.qubit"):
         super().__init__()
         # Embedding layers
         assert image_size % patch_size == 0, "Image size must be divisible by patch size"
@@ -326,7 +401,7 @@ class VisionTransformer(nn.Module):
             ]#:contentReference[oaicite:48]{index=48}
         else:
             blocks = [
-                ViTBlockClassical(embed_dim, num_heads, ffn_dim, dropout=dropout)
+                ViTBlockClassical(embed_dim, num_heads, ffn_dim, dropout=dropout, n_qlayers=n_qlayers, n_qubits_ffn=n_qubits_ffn, q_device=q_device)
                 for _ in range(num_blocks)
             ]#:contentReference[oaicite:49]{index=49}
         self.transformers = nn.Sequential(*blocks)
@@ -340,7 +415,7 @@ class VisionTransformer(nn.Module):
         # x: (batch, in_channels, image_size, image_size)
         x = self.patch_embed(x)        # -> (batch, n_patches, embed_dim)
         x = self.embed(x)        # add positional encoding:contentReference[oaicite:50]{index=50}
-        x = self.transformers(x)       # transformer encoder blocks
+        x = self.transformers(x)
         # Global average pooling over patch dimension
         x = x.mean(dim=1)              # (batch, embed_dim)
         x = self.dropout(x)

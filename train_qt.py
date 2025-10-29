@@ -6,29 +6,54 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 
+import argparse
+
+import string
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument("--n_q_ffn",type=int,default=4,help='the number of qubits on FFN')
+parser.add_argument("--n_q_mha",type=int,default=4,help='the number of qubits on MHA')
+parser.add_argument("--embed",type=int,default=4,help='embed dimension')
+parser.add_argument("--ffn_dim",type=int,default=4,help='ffn dimension')
+parser.add_argument("--n_layer",type=int,default=1,help='the number of qubit layer')
+parser.add_argument("--epochs",type=int,default=20,help='the number of epochs')
+parser.add_argument("--label",type=str,default="",help="label the output name")
+
+args = parser.parse_args()
 # Configuration
 image_size = 98  # e.g., 98 (must be divisible by patch_size)
 patch_size = 14  # e.g., 7
-embed_dim = 16   # Transformer embedding dimension (must equal n_qubits_transformer for quantum attention)
+embed_dim =  args.embed# Transformer embedding dimension (must equal n_qubits_transformer for quantum attention)
 num_heads = 2
 num_blocks = 2
-ffn_dim = 4
-n_qubits_transformer = 0
-n_qubits_ffn = 0
-n_qlayers = 0
-q_device = "default.qubit"  # Quantum device (e.g., default.qubit, braket.qubit, etc.)
+ffn_dim = args.ffn_dim
+n_qubits_transformer = args.n_q_mha
+n_qubits_ffn = args.n_q_ffn
+n_qlayers = args.n_layer
+q_device = "lightning.gpu"  # Quantum device (e.g., default.qubit, braket.qubit, etc.)
 
-dropout = 0.1
-epochs = 200
-batch_size = 64
+dropout = 0.0
+epochs = args.epochs
+batch_size = 16
 learning_rate = 1e-5
+label = args.label
+
+print(f"{epochs} : epochs")
+print(f"{embed_dim} : embed_dim")
+print(f"{n_qlayers} : n_qlayers")
+print(f"{n_qubits_transformer} : n_qubits_transformer")
+print(f"{n_qubits_ffn} : n_qubits_ffn")
+
 
 df = pd.read_csv('rm_invalid.csv')
 
 df = df.sample(frac=1).reset_index(drop=True)
-df_mergedHard   = df[df['Label'] == 'mergedHard'].iloc[:40000]
-df_notMerged    = df[df['Label'] == 'notMerged'].iloc[:40000]
-df_notElectron  = df[df['Label'] == 'notElectron'].iloc[:40000]
+df_mergedHard   = df[df['Label'] == 'mergedHard'].iloc[:1000]
+df_notMerged    = df[df['Label'] == 'notMerged'].iloc[:1000]
+df_notElectron  = df[df['Label'] == 'notElectron'].iloc[:1000]
 df_limited = pd.concat([df_mergedHard, df_notMerged, df_notElectron], ignore_index=True)
 df_limited = df_limited.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
 
@@ -110,6 +135,9 @@ from qvit import VisionTransformer
 
 # Instantiate the Vision Transformer model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
+print("####################")
+print(torch.cuda.is_available())
 model = VisionTransformer(
     image_size=image_size,
     patch_size=patch_size,
@@ -151,13 +179,13 @@ def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='mean'):
         return loss
 
 # Instantiate optimizer (AdamW)
-optimizer = optim.AdamW(model.parameters(), lr=learning_rate,weight_decay = 0.0)
+optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
 
 # Learning rate scheduler: ReduceLROnPlateau (monitor val F1)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.8, patience=8)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.8, patience=3)
 
 # Early stopping parameters
-patience = 200
+patience = 100
 best_val_f1 = -float('inf')
 epochs_no_improve = 0
 
@@ -170,9 +198,10 @@ metrics_history = {
     "train_loss": [], "val_loss": [],
     "train_f1": [], "val_f1": []
 }
-best_model_path = f"/pscratch/sd/e/eoyun/4l/ckpts/pytorch/wo_meta_{pd.Timestamp.now():%Y%m%d_%H%M}/best_model.pth"
+#best_model_path = f"/pscratch/sd/e/eoyun/4l/ckpts/pytorch/quantum_{pd.Timestamp.now():%Y%m%d_%H%M}/best_model.pth"
+best_model_path = f"/pscratch/sd/e/eoyun/4l/ckpts/pytorch/quantum/{epochs}_epochs_{n_qubits_ffn}_qubitOnFFN_{n_qubits_transformer}_qubitOnMHA_{n_qlayers}_qubitLayer_{embed_dim}_embedDimension_{label}/best_model.pth"
 os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
-results_dir = f"/pscratch/sd/e/eoyun/4l/results/pytorch/wo_meta_{pd.Timestamp.now():%Y%m%d_%H%M}"
+results_dir = f"/pscratch/sd/e/eoyun/4l/results/pytorch/quantum/{epochs}_epochs_{n_qubits_ffn}_qubitOnFFN_{n_qubits_transformer}_qubitOnMHA_{n_qlayers}_qubitLayer_{embed_dim}_embedDimension_{label}"
 os.makedirs(results_dir, exist_ok=True)
 
 for epoch in range(1, epochs+1):
@@ -188,7 +217,6 @@ for epoch in range(1, epochs+1):
         # Mixed precision forward and loss
         with autocast():
             logits = model(images)  # model outputs logits directly
-            #loss = nn.CrossEntropyLoss()
             loss = focal_loss(logits, labels)
         train_losses.append(loss.item())
         # Backpropagation
@@ -256,11 +284,23 @@ for epoch in range(1, epochs+1):
         if epochs_no_improve >= patience:
             print(f"No improvement for {patience} epochs. Early stopping at epoch {epoch}.")
             break
+    epochs_range = range(1, len(metrics_history["train_loss"]) + 1)
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1)
+    plt.plot(epochs_range, metrics_history["train_loss"], label="Train Loss")
+    plt.plot(epochs_range, metrics_history["val_loss"], label="Val Loss")
+    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Loss vs Epochs"); plt.legend()
+    
+    plt.subplot(1,2,2)
+    plt.plot(epochs_range, metrics_history["train_f1"], label="Train F1")
+    plt.plot(epochs_range, metrics_history["val_f1"], label="Val F1")
+    plt.xlabel("Epoch"); plt.ylabel("F1 Score"); plt.title("F1 Score vs Epochs"); plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_dir, f"training_history_{epoch}.png"))
 
 print(f"Best model was from epoch {best_epoch} with Val F1 = {best_val_f1:.4f}")
 
-import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, auc
 
 # Load the best model for testing
 ckpt = torch.load(best_model_path)

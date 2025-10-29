@@ -5,30 +5,57 @@ from sklearn.model_selection import train_test_split
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
+import argparse
+
+import string
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument("--n_q_ffn",type=int,default=4,help='the number of qubits on FFN')
+parser.add_argument("--n_q_mha",type=int,default=4,help='the number of qubits on MHA')
+parser.add_argument("--embed",type=int,default=4,help='embed dimension')
+parser.add_argument("--ffn_dim",type=int,default=4,help='ffn dimension')
+parser.add_argument("--n_layer",type=int,default=1,help='the number of qubit layer')
+parser.add_argument("--epochs",type=int,default=20,help='the number of epochs')
+parser.add_argument("--label",type=str,default="",help="label the output name")
+
+args = parser.parse_args()
 # Configuration
 image_size = 98  # e.g., 98 (must be divisible by patch_size)
 patch_size = 14  # e.g., 7
-embed_dim = 16   # Transformer embedding dimension (must equal n_qubits_transformer for quantum attention)
+embed_dim =  args.embed# Transformer embedding dimension (must equal n_qubits_transformer for quantum attention)
 num_heads = 2
 num_blocks = 2
-ffn_dim = 4
-n_qubits_transformer = 0
-n_qubits_ffn = 0
-n_qlayers = 0
-q_device = "default.qubit"  # Quantum device (e.g., default.qubit, braket.qubit, etc.)
+ffn_dim = args.ffn_dim
+n_qubits_transformer = args.n_q_mha
+n_qubits_ffn = args.n_q_ffn
+n_qlayers = args.n_layer
+q_device = "lightning.gpu"  # Quantum device (e.g., default.qubit, braket.qubit, etc.)
 
-dropout = 0.1
-epochs = 200
-batch_size = 64
+dropout = 0.0
+epochs = args.epochs
+batch_size = 16
 learning_rate = 1e-5
+label = args.label
+
+print(f"{epochs} : epochs")
+print(f"{embed_dim} : embed_dim")
+print(f"{n_qlayers} : n_qlayers")
+print(f"{n_qubits_transformer} : n_qubits_transformer")
+print(f"{n_qubits_ffn} : n_qubits_ffn")
+
 
 df = pd.read_csv('rm_invalid.csv')
 
 df = df.sample(frac=1).reset_index(drop=True)
-df_mergedHard   = df[df['Label'] == 'mergedHard'].iloc[:40000]
-df_notMerged    = df[df['Label'] == 'notMerged'].iloc[:40000]
-df_notElectron  = df[df['Label'] == 'notElectron'].iloc[:40000]
+df_mergedHard   = df[df['Label'] == 'mergedHard'].iloc[:1000]
+df_notMerged    = df[df['Label'] == 'notMerged'].iloc[:1000]
+df_notElectron  = df[df['Label'] == 'notElectron'].iloc[:1000]
 df_limited = pd.concat([df_mergedHard, df_notMerged, df_notElectron], ignore_index=True)
 df_limited = df_limited.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
 
@@ -95,21 +122,32 @@ class ImageDataset(Dataset):
             image = self.transform(image)
         return image, label
 
+dist.init_process_group(backend="nccl", init_method="env://")
+
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
 # Create Dataset instances
 train_dataset = ImageDataset(X_train, y_train, transform=train_transforms)
 val_dataset   = ImageDataset(X_val,   y_val,   transform=test_transforms)
 test_dataset  = ImageDataset(X_test,  y_test,  transform=test_transforms)
 
+train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
+
 # Create DataLoaders
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=2)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, sampler=train_sampler)
+val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=2, sampler=val_sampler)
 test_loader  = DataLoader(test_dataset,  batch_size=batch_size*2, shuffle=False, num_workers=2)
 
 import torch.nn as nn
 from qvit import VisionTransformer
 
 # Instantiate the Vision Transformer model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#print(device)
+#print("####################")
+#print(torch.cuda.is_available())
+
 model = VisionTransformer(
     image_size=image_size,
     patch_size=patch_size,
@@ -126,7 +164,8 @@ model = VisionTransformer(
     q_device=q_device
 )
 print(model)
-model.to(device)
+model.to(local_rank)
+ddp_model = DDP(model, device_ids=[local_rank])
 
 from sklearn.metrics import f1_score
 import torch.optim as optim
@@ -151,13 +190,13 @@ def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='mean'):
         return loss
 
 # Instantiate optimizer (AdamW)
-optimizer = optim.AdamW(model.parameters(), lr=learning_rate,weight_decay = 0.0)
+optimizer = optim.AdamW(ddp_model.parameters(), lr=learning_rate)
 
 # Learning rate scheduler: ReduceLROnPlateau (monitor val F1)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.8, patience=8)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.8, patience=3)
 
 # Early stopping parameters
-patience = 200
+patience = 100
 best_val_f1 = -float('inf')
 epochs_no_improve = 0
 
@@ -170,80 +209,166 @@ metrics_history = {
     "train_loss": [], "val_loss": [],
     "train_f1": [], "val_f1": []
 }
-best_model_path = f"/pscratch/sd/e/eoyun/4l/ckpts/pytorch/wo_meta_{pd.Timestamp.now():%Y%m%d_%H%M}/best_model.pth"
+#best_model_path = f"/pscratch/sd/e/eoyun/4l/ckpts/pytorch/quantum_{pd.Timestamp.now():%Y%m%d_%H%M}/best_model.pth"
+best_model_path = f"/pscratch/sd/e/eoyun/4l/ckpts/pytorch/quantum_ddp/{epochs}_epochs_{n_qubits_ffn}_qubitOnFFN_{n_qubits_transformer}_qubitOnMHA_{n_qlayers}_qubitLayer_{embed_dim}_embedDimension_{label}/best_model.pth"
 os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
-results_dir = f"/pscratch/sd/e/eoyun/4l/results/pytorch/wo_meta_{pd.Timestamp.now():%Y%m%d_%H%M}"
+results_dir = f"/pscratch/sd/e/eoyun/4l/results/pytorch/quantum_ddp/{epochs}_epochs_{n_qubits_ffn}_qubitOnFFN_{n_qubits_transformer}_qubitOnMHA_{n_qlayers}_qubitLayer_{embed_dim}_embedDimension_{label}"
 os.makedirs(results_dir, exist_ok=True)
+
+# --- 앞부분 공통 유틸 추가 ---------------------------------------------------- # NEW
+def is_dist():
+    return dist.is_available() and dist.is_initialized()
+
+def get_rank():
+    return dist.get_rank() if is_dist() else 0
+
+def get_world_size():
+    return dist.get_world_size() if is_dist() else 1
+
+def reduce_mean_scalar(x: float) -> float:  # NEW: 스칼라 평균 집계
+    if not is_dist(): 
+        return float(x)
+    t = torch.tensor([x], dtype=torch.float32, device=torch.cuda.current_device())
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return float((t / get_world_size()).item())
+
+def all_gather_numpy_1d(arr_np: np.ndarray, device) -> np.ndarray:  # NEW: 가변 길이 all_gather
+    if not is_dist():
+        return arr_np
+    t = torch.as_tensor(arr_np, device=device)  # 1D
+    l = torch.tensor([t.numel()], device=device, dtype=torch.int64)
+    ls = [torch.zeros_like(l) for _ in range(get_world_size())]
+    dist.all_gather(ls, l)
+    maxlen = int(torch.stack(ls).max().item())
+    pad = torch.zeros(maxlen, dtype=t.dtype, device=device)
+    pad[:t.numel()] = t
+    outs = [torch.zeros_like(pad) for _ in range(get_world_size())]
+    dist.all_gather(outs, pad)
+    outs_trim = []
+    for out, li in zip(outs, ls):
+        outs_trim.append(out[: int(li.item())].clone())
+    return torch.cat(outs_trim, dim=0).detach().cpu().numpy()
+
+def bcast_float(x: float) -> float:  # NEW: rank0 스칼라 브로드캐스트
+    if not is_dist():
+        return float(x)
+    t = torch.tensor([x], dtype=torch.float32, device=torch.cuda.current_device())
+    dist.broadcast(t, src=0)
+    return float(t.item())
+
+def bcast_bool(flag: bool) -> bool:  # NEW
+    if not is_dist():
+        return bool(flag)
+    t = torch.tensor([1 if flag else 0], dtype=torch.int32, device=torch.cuda.current_device())
+    dist.broadcast(t, src=0)
+    return bool(int(t.item()))
+# -----------------------------------------------------------------------------
 
 for epoch in range(1, epochs+1):
     # Training
+    train_sampler.set_epoch(epoch)
     model.train()
     train_losses = []
     all_train_preds = []
     all_train_labels = []
+
     for images, labels in train_loader:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(local_rank)
+        labels = labels.to(local_rank)
         optimizer.zero_grad()
-        # Mixed precision forward and loss
         with autocast():
-            logits = model(images)  # model outputs logits directly
-            #loss = nn.CrossEntropyLoss()
+            logits = ddp_model(images)
             loss = focal_loss(logits, labels)
         train_losses.append(loss.item())
-        # Backpropagation
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        # Collect predictions for F1
         preds = logits.argmax(dim=1)
         all_train_preds.append(preds.detach().cpu().numpy())
         all_train_labels.append(labels.detach().cpu().numpy())
-    # Compute train loss and F1
-    train_loss = np.mean(train_losses)
-    all_train_preds = np.concatenate(all_train_preds)
-    all_train_labels = np.concatenate(all_train_labels)
-    train_f1 = f1_score(all_train_labels, all_train_preds, average='macro')
-    
+
+    # --- 집계: 각 rank의 로컬 값 -> 전역으로 합치기 --------------------------- # CHANGED
+    # loss는 평균을 all_reduce로 통일
+    train_loss_local = float(np.mean(train_losses)) if len(train_losses) else 0.0
+    train_loss = reduce_mean_scalar(train_loss_local)  # NEW
+
+    # F1은 전체 예측/라벨을 모아 rank0에서만 계산
+    train_preds_np_local = np.concatenate(all_train_preds) if all_train_preds else np.array([], dtype=np.int64)
+    train_labels_np_local = np.concatenate(all_train_labels) if all_train_labels else np.array([], dtype=np.int64)
+    # GPU 장치에 올려 all_gather 변장
+    train_preds_all = all_gather_numpy_1d(train_preds_np_local, device=images.device)   # NEW
+    train_labels_all = all_gather_numpy_1d(train_labels_np_local, device=images.device) # NEW
+
+    if get_rank() == 0:  # NEW: rank0만 전역 F1 계산
+        train_f1 = f1_score(train_labels_all, train_preds_all, average='macro')
+    else:
+        train_f1 = 0.0
+    train_f1 = bcast_float(train_f1)  # NEW: 모든 rank에 동일 값 배포
+    # -------------------------------------------------------------------------
+
     # Validation
     model.eval()
     val_losses = []
     all_val_preds = []
     all_val_labels = []
+    val_sampler.set_epoch(epoch)
+
     with torch.no_grad():
         for images, labels in val_loader:
-            images = images.to(device)
-            labels = labels.to(device)
+            images = images.to(local_rank)
+            labels = labels.to(local_rank)
             with autocast():
-                logits = model(images)
+                logits = ddp_model(images)
                 loss = focal_loss(logits, labels)
             val_losses.append(loss.item())
             preds = logits.argmax(dim=1)
             all_val_preds.append(preds.cpu().numpy())
             all_val_labels.append(labels.cpu().numpy())
-    val_loss = np.mean(val_losses)
-    all_val_preds = np.concatenate(all_val_preds)
-    all_val_labels = np.concatenate(all_val_labels)
-    val_f1 = f1_score(all_val_labels, all_val_preds, average='macro')
-    
-    # Record metrics
-    metrics_history["train_loss"].append(train_loss)
-    metrics_history["val_loss"].append(val_loss)
-    metrics_history["train_f1"].append(train_f1)
-    metrics_history["val_f1"].append(val_f1)
-    
-    # Print epoch results
-    print(f"Epoch {epoch:03d}: Train Loss={train_loss:.4f}, Train F1={train_f1:.4f} | "
-          f"Val Loss={val_loss:.4f}, Val F1={val_f1:.4f}")
-    
-    # LR scheduling step (monitor val F1)
-    scheduler.step(val_f1)
-    
-    # Early stopping check
-    if val_f1 > best_val_f1:
+
+    # --- 검증 집계 ------------------------------------------------------------ # CHANGED
+    val_loss_local = float(np.mean(val_losses)) if len(val_losses) else 0.0
+    val_loss = reduce_mean_scalar(val_loss_local)  # NEW
+
+    val_preds_np_local = np.concatenate(all_val_preds) if all_val_preds else np.array([], dtype=np.int64)
+    val_labels_np_local = np.concatenate(all_val_labels) if all_val_labels else np.array([], dtype=np.int64)
+
+    val_preds_all = all_gather_numpy_1d(val_preds_np_local, device=torch.cuda.current_device())  # NEW
+    val_labels_all = all_gather_numpy_1d(val_labels_np_local, device=torch.cuda.current_device()) # NEW
+
+    if get_rank() == 0:  # NEW
+        val_f1 = f1_score(val_labels_all, val_preds_all, average='macro')
+    else:
+        val_f1 = 0.0
+    val_f1 = bcast_float(val_f1)  # NEW
+    # -------------------------------------------------------------------------
+
+    # Record metrics  # CHANGED: 모든 rank가 동일 벡터를 유지하고 싶으면 아래 유지, 아니면 rank0만 기록
+    if get_rank() == 0:  # NEW: 중복 기록 방지
+        metrics_history["train_loss"].append(train_loss)
+        metrics_history["val_loss"].append(val_loss)
+        metrics_history["train_f1"].append(train_f1)
+        metrics_history["val_f1"].append(val_f1)
+
+    # Print epoch results  # CHANGED: rank0만 출력
+    if get_rank() == 0:  # NEW
+        print(f"Epoch {epoch:03d}: Train Loss={train_loss:.4f}, Train F1={train_f1:.4f} | "
+              f"Val Loss={val_loss:.4f}, Val F1={val_f1:.4f}")
+
+    # LR scheduling step  # CHANGED: 모든 rank가 동일한 입력을 쓰므로 어디서든 가능. 관례상 rank0에서만 호출 후 필요하면 브로드캐스트
+    if get_rank() == 0:  # NEW
+        scheduler.step(val_f1)
+    _ = bcast_float(val_f1)  # NO-OP 동기화용 선택 사항
+
+    # Early stopping + Save best  # CHANGED: rank0만 판단·저장, 플래그만 브로드캐스트
+    if get_rank() == 0:  # NEW
+        improved = val_f1 > best_val_f1
+    else:
+        improved = False
+    improved = bcast_bool(improved)  # NEW
+
+    if get_rank() == 0 and improved:  # NEW
         best_val_f1 = val_f1
         epochs_no_improve = 0
-        # Save best model
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -251,17 +376,39 @@ for epoch in range(1, epochs+1):
             "loss": loss,
         }, best_model_path)
         best_epoch = epoch
-    else:
+    elif get_rank() == 0 and not improved:  # NEW
         epochs_no_improve += 1
         if epochs_no_improve >= patience:
             print(f"No improvement for {patience} epochs. Early stopping at epoch {epoch}.")
-            break
+            early_stop = True
+        else:
+            early_stop = False
+    else:
+        early_stop = False
+    early_stop = bcast_bool(early_stop)  # NEW
+    if early_stop:
+        break
+
+    # Plotting  # CHANGED: rank0만 그림 저장
+    if get_rank() == 0:  # NEW
+        epochs_range = range(1, len(metrics_history["train_loss"]) + 1)
+        plt.figure(figsize=(12,5))
+        plt.subplot(1,2,1)
+        plt.plot(epochs_range, metrics_history["train_loss"], label="Train Loss")
+        plt.plot(epochs_range, metrics_history["val_loss"], label="Val Loss")
+        plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Loss vs Epochs"); plt.legend()
+
+        plt.subplot(1,2,2)
+        plt.plot(epochs_range, metrics_history["train_f1"], label="Train F1")
+        plt.plot(epochs_range, metrics_history["val_f1"], label="Val F1")
+        plt.xlabel("Epoch"); plt.ylabel("F1 Score"); plt.title("F1 Score vs Epochs"); plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, f"training_history_{epoch}.png"))
 
 print(f"Best model was from epoch {best_epoch} with Val F1 = {best_val_f1:.4f}")
 
-import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, auc
-
+dist.destroy_process_group()
 # Load the best model for testing
 ckpt = torch.load(best_model_path)
 best_model = VisionTransformer(

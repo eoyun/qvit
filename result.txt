@@ -1,0 +1,6 @@
+wo_meta_20251020_1329 100 epoch
+wo_meta_20251020_1637 increase patient of learning rate decrease
+wo_meta_20251020_1909 remove rotation etc...
+wo_meta_20251020_2235 increase learning rate 2e-5
+wo_meta_20251021_0434 roll back learning rate & increase patient of learning rate 5 -> 8
+wo_meta_20251021_0857 add train dataset
