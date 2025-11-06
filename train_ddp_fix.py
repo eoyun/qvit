@@ -21,6 +21,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torchvision.transforms as transforms
 
 import numpy as np
+os.environ.setdefault("MPLBACKEND", "Agg")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, roc_curve, auc
 
