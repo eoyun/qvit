@@ -178,6 +178,7 @@ class MultiHeadAttentionQuantum(MultiHeadAttentionBase):
         self.k_linear = qml.qnn.TorchLayer(self.qlayer, self.weight_shapes)
         self.v_linear = qml.qnn.TorchLayer(self.qlayer, self.weight_shapes)
         self.combine_heads = qml.qnn.TorchLayer(self.qlayer, self.weight_shapes)
+
     def _eval_q_layer_single(self, layer, x2d: torch.Tensor) -> torch.Tensor:
         # x2d: (N, E) on CPU (device of qnode)
         y = layer(x2d)  # <-- 여기서 단 1회 호출
@@ -370,7 +371,7 @@ class ViTBlockQuantum(ViTBlockBase):
 class VisionTransformer(nn.Module):
     def __init__(self,
                  image_size=98, patch_size=7, in_channels=3,
-                 embed_dim=16, num_heads=2, num_blocks=2, num_classes=10,
+                 embed_dim=16, num_heads=2, num_blocks=2,num_quantum_blocks =2, num_classes=10,
                  ffn_dim=32,
                  n_qubits_transformer=0, n_qubits_ffn=0, n_qlayers=1,
                  dropout=0.0, q_device="default.qubit"):
@@ -384,6 +385,7 @@ class VisionTransformer(nn.Module):
         # Configure transformer blocks (quantum or classical)
         print(f"++ There will be {num_blocks} transformer blocks.")
         if n_qubits_transformer and n_qubits_transformer > 0:
+            print(f"++ There will be {num_quantum_blocks} quantum transformer blocks.")
             print(f"++ Using quantum attention with {n_qubits_transformer} qubits and {n_qlayers} q-layers per block.")
             if n_qubits_ffn and n_qubits_ffn > 0:
                 print(f"++ Using quantum feed-forward network with {n_qubits_ffn} qubits.")
@@ -392,13 +394,18 @@ class VisionTransformer(nn.Module):
             print(f"++ Quantum device: {q_device}")
             # For quantum mode, ensure dimensions match
             assert embed_dim == n_qubits_transformer, "embed_dim must equal n_qubits_transformer in quantum mode"
-            blocks = [
+            blocks_classical = [
+                ViTBlockClassical(embed_dim, num_heads, ffn_dim, dropout=dropout, n_qlayers=n_qlayers, n_qubits_ffn=n_qubits_ffn, q_device=q_device)
+                for _ in range(num_blocks - num_quantum_blocks)
+            ]
+            blocks_quantum = [
                 ViTBlockQuantum(embed_dim, num_heads, ffn_dim,
                                 n_qubits_transformer=n_qubits_transformer,
                                 n_qubits_ffn=n_qubits_ffn,
                                 n_qlayers=n_qlayers, dropout=dropout, q_device=q_device)
-                for _ in range(num_blocks)
+                for _ in range(num_quantum_blocks)
             ]#:contentReference[oaicite:48]{index=48}
+            blocks = blocks_classical + blocks_quantum
         else:
             blocks = [
                 ViTBlockClassical(embed_dim, num_heads, ffn_dim, dropout=dropout, n_qlayers=n_qlayers, n_qubits_ffn=n_qubits_ffn, q_device=q_device)

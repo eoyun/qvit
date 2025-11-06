@@ -15,6 +15,28 @@ import torchvision.transforms as transforms
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, roc_curve, auc
+# 이제 이 프로세스엔 "하나의 GPU(인덱스 0)"만 보이므로 이후에는 cuda:0로만 접근
+
+# 환경변수 강제
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+# PyTorch 스레드 강제
+torch.set_num_threads(4)
+torch.set_num_interop_threads(4)
+
+# 선택: MKL 패키지 있을 때만
+try:
+    import mkl
+    mkl.set_num_threads(4)
+except Exception:
+    pass
+
+# 확인 출력
+if os.environ.get("RANK") in (None, "0"):
+    print("OMP", os.environ.get("OMP_NUM_THREADS"),
+          "MKL", os.environ.get("MKL_NUM_THREADS"),
+          "torch-threads", torch.get_num_threads(),
+          "interop", torch.get_num_interop_threads(), flush=True)
 
 # -------------------- args --------------------
 p = argparse.ArgumentParser()
@@ -28,6 +50,7 @@ p.add_argument("--patch_size", type=int, default=14)
 p.add_argument("--embed_dim", type=int, default=4)  # ViT dim
 p.add_argument("--num_heads", type=int, default=2)
 p.add_argument("--num_blocks", type=int, default=2)
+p.add_argument("--num_quantum_blocks", type=int, default=1)
 p.add_argument("--ffn_dim", type=int, default=4)
 p.add_argument("--n_qlayers", type=int, default=1)
 p.add_argument("--n_qubits_transformer", type=int, default=4)
@@ -46,6 +69,7 @@ patch_size = args.patch_size
 embed_dim = args.embed_dim
 num_heads = args.num_heads
 num_blocks = args.num_blocks
+num_quantum_blocks = args.num_quantum_blocks
 ffn_dim = args.ffn_dim
 n_qlayers = args.n_qlayers
 n_qubits_transformer = args.n_qubits_transformer
@@ -66,7 +90,7 @@ distributed = ("RANK" in os.environ and "WORLD_SIZE" in os.environ)
 backend = "nccl" if use_cuda else "gloo"  # CHANGED: GPU 없으면 gloo
 if distributed:
     dist.init_process_group(backend=backend, init_method="env://")
-local_rank = int(os.environ.get("LOCAL_RANK", 0))
+local_rank = int(os.environ.get("LOCAL_RANK", 0)
 if use_cuda:
     torch.cuda.set_device(local_rank)
 device = torch.device(f"cuda:{local_rank}") if use_cuda else torch.device("cpu")
@@ -114,8 +138,11 @@ def all_gather_numpy_1d(arr_np: np.ndarray) -> np.ndarray:  # CHANGED: 가변 �
 
 # -------------------- Data --------------------
 df = pd.read_csv(csv_path)
+df[label_col] = df[label_col].replace('mergedNotHard','notMerged')
 # 필요시 클래스 제한 샘플링은 여기서 조정
 df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+
+df = df.groupby(label_col, group_keys=False).apply(lambda x: x.head(min(1000, len(x)))).reset_index(drop=True)
 
 labels_sorted = sorted(df[label_col].unique().tolist())
 label_to_idx = {lab: i for i, lab in enumerate(labels_sorted)}
@@ -125,6 +152,7 @@ num_classes = len(labels_sorted)
 
 X = df[path_col].values
 y = df["LabelIdx"].values
+print(X.size)
 X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 X_test, X_val, y_test, y_val = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
 
@@ -177,6 +205,7 @@ model = VisionTransformer(
     embed_dim=embed_dim,
     num_heads=num_heads,
     num_blocks=num_blocks,
+    num_quantum_blocks=num_quantum_blocks,
     num_classes=num_classes,
     ffn_dim=ffn_dim,
     n_qubits_transformer=n_qubits_transformer,
@@ -193,14 +222,14 @@ else:
 
 # -------------------- Loss/Opt/Sched --------------------
 class FocalLoss(torch.nn.Module):
-    def __init__(self, gamma=2.0, reduction="mean"):
+    def __init__(self,alpha = 0.25, gamma=2.0, reduction="mean"):
         super().__init__()
         self.gamma = gamma
         self.reduction = reduction
     def forward(self, logits, target):
         ce = torch.nn.functional.cross_entropy(logits, target, reduction="none")
         pt = torch.exp(-ce)
-        loss = (1 - pt)**self.gamma * ce
+        loss = alpha*(1 - pt)**self.gamma * ce
         if self.reduction == "mean": return loss.mean()
         if self.reduction == "sum":  return loss.sum()
         return loss

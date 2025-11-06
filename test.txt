@@ -1,2 +1,4 @@
 salloc --nodes=1 --account=m4138_g --qos=interactive --time=04:00:00 -C gpu -G 4 
-torchrun --nproc_per_node=4 train_ddp.py --n_qubits_ffn 0 --n_qubits_transformer 0 --ffn_dim 0 --embed_dim 4 --n_qlayers 0 --epochs 30 --label 251028_interactive
+//torchrun --nproc_per_node=4 train_ddp.py --n_qubits_ffn 0 --n_qubits_transformer 0 --ffn_dim 0 --embed_dim 4 --n_qlayers 0 --epochs 30 --label 251028_interactive
+torchrun --nproc_per_node=4 train_ddp_fix.py --n_qubits_ffn 4 --n_qubits_transformer 4 --batch_size 64 --ffn_dim 4 --embed_dim 4 --n_qlayers 2 --num_quantum_blocks 2 --epochs 30 --label 251104_interactive
+
