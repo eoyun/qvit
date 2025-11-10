@@ -41,10 +41,10 @@ COMBOS=(
 )
 
 read -r NQUBITS_FFN NQUBITS_TRANS NQLAYERS NQBLOCKS <<< "${COMBOS[$SLURM_ARRAY_TASK_ID]}"
-LABEL="251106_qsweep_q${NQUBITS_FFN}_${NQUBITS_TRANS}_l${NQLAYERS}_b${NQBLOCKS}"
+LABEL="251110_qsweep_q${NQUBITS_FFN}_${NQUBITS_TRANS}_l${NQLAYERS}_b${NQBLOCKS}"
 
 # 각 task는 자기 노드에서 4프로세스만 띄움
-torchrun \
+python -m torch.distributed.run \
   --nnodes=1 \
   --nproc_per_node=4 \
   train_ddp_fix.py \

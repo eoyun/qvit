@@ -27,6 +27,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, roc_curve, auc
+import json
 
 # -------------------- 스레드 설정(선택) --------------------
 os.environ.setdefault("OMP_NUM_THREADS", "4")
@@ -205,6 +206,32 @@ def main():
         q_device=args.q_device
     ).to(device)
 
+    # -------------------- Resume from best model if exists --------------------
+    start_epoch = 1
+    best_val_f1 = -1.0
+    epochs_no_improve = 0
+
+    if os.path.exists(best_model_path):
+        if rank() == 0:
+            print(f"Loading best model from: {best_model_path}", flush=True)
+        checkpoint = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        # 스케줄러 상태를 저장해두었으면 함께 복원
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        best_val_f1 = float(checkpoint.get("best_val_f1", -1.0))
+        epochs_no_improve = int(checkpoint.get("epochs_no_improve", 0))
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+
+        if rank() == 0:
+            print(f"Resuming from epoch {start_epoch} with best_val_f1={best_val_f1:.4f} "
+                  f"and epochs_no_improve={epochs_no_improve}", flush=True)
+
+    # 히스토리 파일이 있다면, 플롯을 이어 그릴 수 있도록 start_epoch는 히스토리에 종속되지 않음.
+    # 학습 루프는 start_epoch부터 재개, 플롯은 metrics_history 길이에 맞춰 이어서 그려짐.
+
+
     if distributed:
         # device_ids는 현재 보이는 단일 GPU 0만 지정
         ddp_model = DDP(model, device_ids=[0] if use_cuda else None, broadcast_buffers=False)
@@ -239,7 +266,26 @@ def main():
         os.makedirs(results_dir, exist_ok=True)
         os.makedirs(ckpt_dir, exist_ok=True)
     best_model_path = os.path.join(ckpt_dir, f"best_vit_e{args.epochs}_dim{args.embed_dim}_ql{args.n_qlayers}.pth")
+    history_path = os.path.join(results_dir, "history.json")
+
+
     metrics_history = {"train_loss":[], "val_loss":[], "train_f1":[], "val_f1":[]}
+    last_epoch_in_history = 0
+    if os.path.exists(history_path):
+        try:
+            with open(history_path, "r") as f:
+                _h = json.load(f)
+            # 라벨이 같은 경우에만 이어서 그림
+            # best model의 args.label과 현재 args.label이 같아야 한다는 전제
+            metrics_history = {
+                "train_loss": _h.get("train_loss", []),
+                "val_loss":   _h.get("val_loss", []),
+                "train_f1":   _h.get("train_f1", []),
+                "val_f1":     _h.get("val_f1", [])
+            }
+            last_epoch_in_history = int(_h.get("last_epoch", 0))
+        except Exception:
+            pass
 
     # -------------------- Train/Eval helpers --------------------
     def run_epoch(model_ref, loader, train: bool):
@@ -287,7 +333,9 @@ def main():
     best_val_f1 = -1.0
     epochs_no_improve = 0
 
-    for epoch in range(1, args.epochs+1):
+    #for epoch in range(1, args.epochs+1):
+    for epoch in range(start_epoch, args.epochs+1):
+
         if distributed and train_sampler is not None: train_sampler.set_epoch(epoch)
         if distributed and val_sampler   is not None: val_sampler.set_epoch(epoch)
 
@@ -310,12 +358,25 @@ def main():
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "best_val_f1": best_val_f1,
+                    "epochs_no_improve": epochs_no_improve,
                     "label_map": idx_to_label,
                     "args": vars(args),
                 }, best_model_path)
             else:
                 epochs_no_improve += 1
+
+            # save history to resume plots later
+            with open(history_path, "w") as f:
+                json.dump({
+                    "train_loss": metrics_history["train_loss"],
+                    "val_loss":   metrics_history["val_loss"],
+                    "train_f1":   metrics_history["train_f1"],
+                    "val_f1":     metrics_history["val_f1"],
+                    "last_epoch": epoch,
+                    "label": args.label
+                }, f)
 
             # plot learning curves
             epochs_range = range(1, len(metrics_history["train_loss"]) + 1)
