@@ -20,6 +20,8 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torchvision.transforms as transforms
 
+import random
+
 import numpy as np
 os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -28,6 +30,23 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, roc_curve, auc
 import json
+
+seed = 42  # 원하는 숫자
+
+# Python 기본 random
+random.seed(seed)
+
+# NumPy
+np.random.seed(seed)
+
+# PyTorch
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)  # multi-GPU 환경일 때
+
+# 연산 일관성 확보 (Deterministic 연산)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # -------------------- 스레드 설정(선택) --------------------
 os.environ.setdefault("OMP_NUM_THREADS", "4")
@@ -126,7 +145,7 @@ def main():
     df = pd.read_csv(args.csv_path)
     label_col = "Label"; path_col = "ImagePath"
     df[label_col] = df[label_col].replace('mergedNotHard','notMerged')
-    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
     df = df.groupby(label_col, group_keys=False).apply(lambda x: x.head(min(1000, len(x)))).reset_index(drop=True)
 
     labels_sorted = sorted(df[label_col].unique().tolist())
@@ -140,8 +159,8 @@ def main():
     if rank() == 0:
         print("NUM SAMPLES:", X.size, flush=True)
 
-    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-    X_test, X_val, y_test, y_val = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
+    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y)
+    X_test, X_val, y_test, y_val = train_test_split(X_temp, y_temp, test_size=0.5, random_state=seed, stratify=y_temp)
 
     image_size = args.image_size
     train_tf = transforms.Compose([
@@ -183,6 +202,15 @@ def main():
                               num_workers=args.num_workers, pin_memory=use_cuda, persistent_workers=args.num_workers>0)
     test_loader  = DataLoader(test_ds,  batch_size=args.batch_size*2, sampler=test_sampler, shuffle=False,
                               num_workers=args.num_workers, pin_memory=use_cuda, persistent_workers=args.num_workers>0)
+    # -------------------- Paths --------------------
+    label = args.label
+    results_dir = f"/pscratch/sd/e/eoyun/4l/results/pytorch/quantum/{args.epochs}_epochs_{args.n_qubits_ffn}_qubitOnFFN_{args.n_qubits_transformer}_qubitOnMHA_{args.n_qlayers}_qubitLayer_{args.embed_dim}_embedDimension_{label}"
+    ckpt_dir = f"/pscratch/sd/e/eoyun/4l/ckpts/pytorch/quantum/{args.epochs}_epochs_{args.n_qubits_ffn}_qubitOnFFN_{args.n_qubits_transformer}_qubitOnMHA_{args.n_qlayers}_qubitLayer_{args.embed_dim}_embedDimension_{label}"
+    if rank() == 0:
+        os.makedirs(results_dir, exist_ok=True)
+        os.makedirs(ckpt_dir, exist_ok=True)
+    best_model_path = os.path.join(ckpt_dir, f"best_vit_e{args.epochs}_dim{args.embed_dim}_ql{args.n_qlayers}.pth")
+    history_path = os.path.join(results_dir, "history.json")
 
     # -------------------- Model --------------------
     # 주의: 외부 백엔드(q_device="lightning.gpu")가 기본 cuda:0을 잡아도
@@ -205,7 +233,7 @@ def main():
         dropout=args.dropout,
         q_device=args.q_device
     ).to(device)
-
+    print(model)
     # -------------------- Resume from best model if exists --------------------
     start_epoch = 1
     best_val_f1 = -1.0
@@ -258,15 +286,6 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
     scaler = torch.cuda.amp.GradScaler(enabled=use_cuda)
 
-    # -------------------- Paths --------------------
-    label = args.label
-    results_dir = f"/pscratch/sd/e/eoyun/4l/results/pytorch/quantum/{args.epochs}_epochs_{args.n_qubits_ffn}_qubitOnFFN_{args.n_qubits_transformer}_qubitOnMHA_{args.n_qlayers}_qubitLayer_{args.embed_dim}_embedDimension_{label}"
-    ckpt_dir = f"/pscratch/sd/e/eoyun/4l/ckpts/pytorch/quantum/{args.epochs}_epochs_{args.n_qubits_ffn}_qubitOnFFN_{args.n_qubits_transformer}_qubitOnMHA_{args.n_qlayers}_qubitLayer_{args.embed_dim}_embedDimension_{label}"
-    if rank() == 0:
-        os.makedirs(results_dir, exist_ok=True)
-        os.makedirs(ckpt_dir, exist_ok=True)
-    best_model_path = os.path.join(ckpt_dir, f"best_vit_e{args.epochs}_dim{args.embed_dim}_ql{args.n_qlayers}.pth")
-    history_path = os.path.join(results_dir, "history.json")
 
 
     metrics_history = {"train_loss":[], "val_loss":[], "train_f1":[], "val_f1":[]}
