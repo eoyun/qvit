@@ -234,6 +234,26 @@ def main():
         q_device=args.q_device
     ).to(device)
     print(model)
+    # -------------------- Loss/Opt/Sched --------------------
+    class FocalLoss(torch.nn.Module):
+        def __init__(self, alpha=0.25, gamma=2.0, reduction="mean"):
+            super().__init__()
+            self.alpha = alpha
+            self.gamma = gamma
+            self.reduction = reduction
+        def forward(self, logits, target):
+            ce = torch.nn.functional.cross_entropy(logits, target, reduction="none")
+            pt = torch.exp(-ce)
+            loss = self.alpha * (1 - pt)**self.gamma * ce
+            if self.reduction == "mean": return loss.mean()
+            if self.reduction == "sum":  return loss.sum()
+            return loss
+
+    loss_fn = FocalLoss(gamma=2.0, reduction="mean")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_cuda)
+
     # -------------------- Resume from best model if exists --------------------
     start_epoch = 1
     best_val_f1 = -1.0
@@ -265,26 +285,6 @@ def main():
         ddp_model = DDP(model, device_ids=[0] if use_cuda else None, broadcast_buffers=False)
     else:
         ddp_model = model
-
-    # -------------------- Loss/Opt/Sched --------------------
-    class FocalLoss(torch.nn.Module):
-        def __init__(self, alpha=0.25, gamma=2.0, reduction="mean"):
-            super().__init__()
-            self.alpha = alpha
-            self.gamma = gamma
-            self.reduction = reduction
-        def forward(self, logits, target):
-            ce = torch.nn.functional.cross_entropy(logits, target, reduction="none")
-            pt = torch.exp(-ce)
-            loss = self.alpha * (1 - pt)**self.gamma * ce
-            if self.reduction == "mean": return loss.mean()
-            if self.reduction == "sum":  return loss.sum()
-            return loss
-
-    loss_fn = FocalLoss(gamma=2.0, reduction="mean")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_cuda)
 
 
 

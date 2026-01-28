@@ -6,8 +6,7 @@
 #SBATCH -N 1                    # 각 task당 1노드
 #SBATCH --ntasks-per-node=1     # 노드당 1개 랭처
 #SBATCH -G 4                    # Perlmutter GPU 4개 = full GPU node
-#SBATCH --exclusive             # 노드 독점
-#SBATCH -t 12:00:00
+#SBATCH -t 48:00:00
 #SBATCH -o outputs/%x-%j_%a.out
 #SBATCH -e outputs/%x-%j_%a.err
 #SBATCH --array=0-9             # 조합 개수-1 로 조정
