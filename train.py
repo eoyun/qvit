@@ -5,30 +5,38 @@ from sklearn.model_selection import train_test_split
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
+import numpy as np
 
 # Configuration
 image_size = 98  # e.g., 98 (must be divisible by patch_size)
 patch_size = 14  # e.g., 7
-embed_dim = 16   # Transformer embedding dimension (must equal n_qubits_transformer for quantum attention)
+embed_dim = 64   # Transformer embedding dimension (must equal n_qubits_transformer for quantum attention)
 num_heads = 2
 num_blocks = 2
-ffn_dim = 4
+ffn_dim = 32
 n_qubits_transformer = 0
 n_qubits_ffn = 0
 n_qlayers = 0
 q_device = "default.qubit"  # Quantum device (e.g., default.qubit, braket.qubit, etc.)
-
+performer_num_features = 8
+performer_redraw_features = True
+attn_type = "performer"
 dropout = 0.1
 epochs = 200
 batch_size = 64
 learning_rate = 1e-5
 
-df = pd.read_csv('rm_invalid.csv')
+df = pd.read_csv("251112_v1_v1.csv")
+df = df.sample(frac=1, random_state=10).reset_index(drop=True)
+df = df[df['pT']>20]
+df_mergedHard = df[df['Label'] == 'mergedHard'].reset_index(drop=True)
+df_mergedHard = df_mergedHard.iloc[:40000]
+#print(df_mergedHard)
+df_notMerged = df[df['Label'] == 'notMerged'].reset_index(drop=True)
+df_notMerged = df_notMerged.iloc[:100000]
+df_notElectron = df[df['Label'] == 'notElectron'].reset_index(drop=True)
+df_notElectron = df_notElectron.iloc[:100000]
 
-df = df.sample(frac=1).reset_index(drop=True)
-df_mergedHard   = df[df['Label'] == 'mergedHard'].iloc[:40000]
-df_notMerged    = df[df['Label'] == 'notMerged'].iloc[:40000]
-df_notElectron  = df[df['Label'] == 'notElectron'].iloc[:40000]
 df_limited = pd.concat([df_mergedHard, df_notMerged, df_notElectron], ignore_index=True)
 df_limited = df_limited.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
 
@@ -43,10 +51,73 @@ df_limited['LabelIdx'] = df_limited['Label'].map(label_to_idx)
 
 X = df_limited['ImagePath'].values
 y = df_limited['LabelIdx'].values
+y_txt = df_limited['Label'].to_numpy()
+labels_txt = np.unique(y_txt)
 # First split off 20% as test, then split the remaining 80% equally into train/val
-X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, 
+#################################3
+# x: 불균형을 유발하는 variable (예: pt)
+# y: class label
+bins = np.array([0,20,30,50,75,100,125,150,200,250,300,350,400,500,600,800,1000,1500, np.inf], dtype=float)
+nbins = len(bins) - 1
+
+pTs = df_limited['pT'].to_numpy()
+
+bin_idx = np.digitize(pTs, bins) - 1
+#print(pTs.min(), pTs.max())
+bin_idx = np.clip(bin_idx, 0, nbins - 1)
+
+
+# (class, bin) D \H~X DB�
+counts = {}
+for c in labels_txt:
+    for b in range(nbins):
+        counts[(c, b)] = np.sum((y_txt == c) & (bin_idx == b))
+        #print("example c,b:", c, b)
+
+print(counts)
+# weight DB�
+weights = np.zeros(len(pTs))
+for i in range(len(pTs)):
+    c = y_txt[i]
+    b = bin_idx[i]
+    #print(pTs[i])
+    #print("example c,b:", c, b)
+    #print("b range:", bin_idx.min(), bin_idx.max(), "expected:", 0, nbins-1)
+    #print("has class in classes?:", c in labels)
+    #print("count key exists?:", (c, b) in counts)
+    weights[i] = 1.0 / max(counts[(c, b)], 1)
+
+# class-wise weight sum
+class_weight_sum = {
+    c: np.sum(weights[y_txt == c]) for c in labels_txt
+}
+
+# target sum per class (mean over classes)
+target_sum = np.mean(list(class_weight_sum.values()))
+
+# rescale weights per class
+for c in labels_txt:
+    mask = (y_txt == c)
+    if class_weight_sum[c] > 0:
+        weights[mask] *= target_sum / class_weight_sum[c]
+
+
+#  ~U\Y~T (D| C~](          )
+print(f"len is {len(weights)}")
+print(weights.sum())
+print(weights)
+weights *= len(weights) / weights.sum()
+##################333
+
+for c in labels_txt:
+    print(f"\nClass {c}")
+    for b in range(nbins):
+        mask = (y_txt == c) & (bin_idx == b)
+        print(f"  bin {b}: entries={np.sum(mask):6d}, "
+              f"sum(weights)={np.sum(weights[mask]):8.4f}")
+X_train, X_temp, y_train, y_temp, weights_train, weights_temp = train_test_split(X, y, weights, test_size=0.2, 
     random_state=42, stratify=y)
-X_test, X_val, y_test, y_val = train_test_split(X_temp, y_temp, test_size=0.5, 
+X_test, X_val, y_test, y_val, weights_test, weights_val = train_test_split(X_temp, y_temp, weights_temp, test_size=0.5, 
     random_state=42, stratify=y_temp)
 print(f"Train size: {len(X_train)}, Val size: {len(X_val)}, Test size: {len(X_test)}")
 
@@ -80,25 +151,27 @@ test_transforms = transforms.Compose([
 ])
 
 class ImageDataset(Dataset):
-    def __init__(self, image_paths, labels, transform=None):
+    def __init__(self, image_paths, labels, weights, transform=None):
         self.image_paths = image_paths
         self.labels = labels  # numeric labels
+        self.weights = weights  # numeric labels
         self.transform = transform
     def __len__(self):
         return len(self.image_paths)
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         label = self.labels[idx]
+        weights = self.weights[idx]
         # Open image (ensure 3 channels)
         image = Image.open(img_path).convert("RGB")
         if self.transform:
             image = self.transform(image)
-        return image, label
+        return image, label, weights
 
 # Create Dataset instances
-train_dataset = ImageDataset(X_train, y_train, transform=train_transforms)
-val_dataset   = ImageDataset(X_val,   y_val,   transform=test_transforms)
-test_dataset  = ImageDataset(X_test,  y_test,  transform=test_transforms)
+train_dataset = ImageDataset(X_train, y_train, weights_train, transform=train_transforms)
+val_dataset   = ImageDataset(X_val,   y_val,   weights_val,   transform=test_transforms)
+test_dataset  = ImageDataset(X_test,  y_test,  weights_test,  transform=test_transforms)
 
 # Create DataLoaders
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
@@ -123,7 +196,10 @@ model = VisionTransformer(
     n_qubits_ffn=n_qubits_ffn,
     n_qlayers=n_qlayers,
     dropout=dropout,
-    q_device=q_device
+    q_device=q_device,
+    attn_type=attn_type,
+    performer_num_features=performer_num_features,
+    performer_redraw_features=performer_redraw_features
 )
 print(model)
 model.to(device)
@@ -133,16 +209,20 @@ import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 
 # Define focal loss function
-def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='mean'):
+def focal_loss(inputs, targets, weights = None, alpha=0.25, gamma=2.0, reduction='mean',weighted=True):
     """
     Compute the focal loss between `inputs` (logits) and `targets` (integer class indices).
     """
     # Standard cross-entropy (not averaged, per-sample)
+    #print(f"shape is {weights.shape}")
     ce_loss = torch.nn.functional.cross_entropy(inputs, targets, reduction='none')
     # p_t: probability of the true class for each sample
     p_t = torch.exp(-ce_loss)
     # Focal loss computation
-    loss = alpha * ((1 - p_t) ** gamma) * ce_loss
+    if weighted :
+        loss = (alpha * ((1 - p_t) ** gamma) * ce_loss * weights).sum() / (weights.sum() + 1e-12)
+    else :
+        loss = alpha * ((1 - p_t) ** gamma) * ce_loss
     if reduction == 'mean':
         return loss.mean()
     elif reduction == 'sum':
@@ -170,9 +250,9 @@ metrics_history = {
     "train_loss": [], "val_loss": [],
     "train_f1": [], "val_f1": []
 }
-best_model_path = f"/pscratch/sd/e/eoyun/4l/ckpts/pytorch/wo_meta_{pd.Timestamp.now():%Y%m%d_%H%M}/best_model.pth"
+best_model_path = f"./ckpts/pytorch/wo_meta_{pd.Timestamp.now():%Y%m%d_%H%M}/best_model.pth"
 os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
-results_dir = f"/pscratch/sd/e/eoyun/4l/results/pytorch/wo_meta_{pd.Timestamp.now():%Y%m%d_%H%M}"
+results_dir = f"./results/pytorch/wo_meta_{pd.Timestamp.now():%Y%m%d_%H%M}"
 os.makedirs(results_dir, exist_ok=True)
 
 for epoch in range(1, epochs+1):
@@ -181,15 +261,16 @@ for epoch in range(1, epochs+1):
     train_losses = []
     all_train_preds = []
     all_train_labels = []
-    for images, labels in train_loader:
+    for images, labels, weights in train_loader:
         images = images.to(device)
         labels = labels.to(device)
+        weights = weights.to(device)
         optimizer.zero_grad()
         # Mixed precision forward and loss
         with autocast():
             logits = model(images)  # model outputs logits directly
             #loss = nn.CrossEntropyLoss()
-            loss = focal_loss(logits, labels)
+            loss = focal_loss(logits, labels, weights)
         train_losses.append(loss.item())
         # Backpropagation
         scaler.scale(loss).backward()
@@ -211,12 +292,12 @@ for epoch in range(1, epochs+1):
     all_val_preds = []
     all_val_labels = []
     with torch.no_grad():
-        for images, labels in val_loader:
+        for images, labels, weights in val_loader:
             images = images.to(device)
             labels = labels.to(device)
             with autocast():
                 logits = model(images)
-                loss = focal_loss(logits, labels)
+                loss = focal_loss(logits, labels, weighted = False)
             val_losses.append(loss.item())
             preds = logits.argmax(dim=1)
             all_val_preds.append(preds.cpu().numpy())
@@ -277,7 +358,10 @@ best_model = VisionTransformer(
     n_qubits_ffn=n_qubits_ffn,
     n_qlayers=n_qlayers,
     dropout=dropout,
-    q_device=q_device
+    q_device=q_device,
+    attn_type=attn_type,
+    performer_num_features=performer_num_features,
+    performer_redraw_features=performer_redraw_features
 )
 best_model.load_state_dict(ckpt["model_state_dict"])
 best_model.to(device)
@@ -287,7 +371,7 @@ best_model.eval()
 y_true = []
 y_prob = []  # probabilities for each class
 with torch.no_grad():
-    for images, labels in test_loader:
+    for images, labels, weights in test_loader:
         images = images.to(device)
         labels = labels.to(device)
         logits = best_model(images)

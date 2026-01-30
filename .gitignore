@@ -3,3 +3,4 @@ results/
 rm_invalid.csv
 rm_invalid.csv
 outputs/
+*.csv

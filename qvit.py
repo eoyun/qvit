@@ -149,6 +149,83 @@ class MultiHeadAttentionClassical(MultiHeadAttentionBase):
         # Final linear to combine heads:contentReference[oaicite:30]{index=30}
         return self.combine_heads(context)
 
+class MultiHeadAttentionPerformer(MultiHeadAttentionBase):
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        dropout=0.0,
+        mask=None,
+        use_bias=False,
+        num_features=64,
+        redraw_features=False,
+    ):
+        super().__init__(embed_dim, num_heads, dropout, mask, use_bias)
+        self.q_linear = nn.Linear(embed_dim, embed_dim, bias=use_bias)
+        self.k_linear = nn.Linear(embed_dim, embed_dim, bias=use_bias)
+        self.v_linear = nn.Linear(embed_dim, embed_dim, bias=use_bias)
+        self.combine_heads = nn.Linear(embed_dim, embed_dim, bias=use_bias)
+        self.num_features = num_features
+        self.redraw_features = redraw_features
+        #self.projection_matrix = nn.Parameter(
+        #    torch.randn(num_heads, num_features, self.d_k)
+        #)
+        self.register_buffer(
+            "projection_matrix",
+            torch.randn(num_heads, num_features, self.d_k),
+        )
+
+    def _redraw_projection(self, device):
+        with torch.no_grad():
+            self.projection_matrix.data = torch.randn(
+                self.num_heads,
+                self.num_features,
+                self.d_k,
+                device=device,
+            )
+
+    def _random_fourier_features(self, x):
+        # x: (batch, heads, seq_len, d_k)
+        if self.redraw_features or self.projection_matrix.device != x.device:
+            self._redraw_projection(x.device)
+        x = x / math.sqrt(self.d_k)
+        projection = torch.einsum("bhse,hmd->bhsm", x, self.projection_matrix)
+        x_norm = (x ** 2).sum(dim=-1, keepdim=True) / 2
+        logits = projection - x_norm
+        logits = logits - logits.max(dim=-1, keepdim=True).values
+        features = torch.exp(logits)        
+        return features / math.sqrt(self.num_features)
+
+    def attention(self, Q, K, V, mask=None):
+        phi_q = self._random_fourier_features(Q)
+        phi_k = self._random_fourier_features(K)
+        if mask is not None:
+            key_mask = mask.unsqueeze(1).unsqueeze(-1)
+            phi_k = phi_k * key_mask
+            V = V * key_mask
+        kv = torch.einsum("bhsm,bhsd->bhmd", phi_k, V)
+        k_sum = phi_k.sum(dim=2)
+        denom = torch.einsum("bhsm,bhm->bhs", phi_q, k_sum).unsqueeze(-1)
+        denom = denom + 1e-6
+        context = torch.einsum("bhsm,bhmd->bhsd", phi_q, kv) / denom
+        return context, None
+
+    def forward(self, x, mask=None):
+        batch_size, seq_len, embed_dim = x.size()
+        assert embed_dim == self.embed_dim
+        Q = self.q_linear(x)
+        K = self.k_linear(x)
+        V = self.v_linear(x)
+        context = self.downstream(
+            self.separate_heads(Q),
+            self.separate_heads(K),
+            self.separate_heads(V),
+            batch_size,
+            mask,
+        )
+        return self.combine_heads(context)
+
+
 class MultiHeadAttentionQuantum(MultiHeadAttentionBase):
     def __init__(self, embed_dim, num_heads, dropout=0.0, mask=None, use_bias=False,
                  n_qubits=4, n_qlayers=1, q_device="default.qubit"):
@@ -341,10 +418,31 @@ class ViTBlockBase(nn.Module):
         return x
 
 class ViTBlockClassical(ViTBlockBase):
-    def __init__(self, embed_dim, num_heads, ffn_dim, n_qlayers, n_qubits_ffn, q_device, dropout=0.0):
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        ffn_dim,
+        n_qlayers,
+        n_qubits_ffn,
+        q_device,
+        dropout=0.0,
+        attn_type="classical",
+        performer_num_features=64,
+        performer_redraw_features=False,
+    ):
         super().__init__(embed_dim, num_heads, ffn_dim, dropout)
         # Classical attention and FFN
-        self.attn = MultiHeadAttentionClassical(embed_dim, num_heads, dropout=dropout)
+        if attn_type == "performer":
+            self.attn = MultiHeadAttentionPerformer(
+                embed_dim,
+                num_heads,
+                dropout=dropout,
+                num_features=performer_num_features,
+                redraw_features=performer_redraw_features,
+            )
+        else:
+            self.attn = MultiHeadAttentionClassical(embed_dim, num_heads, dropout=dropout)        
         # Quantum or classical FFN depending on n_qubits_ffn
         if n_qubits_ffn > 0:
             self.ffn = FeedForwardQuantum(embed_dim, n_qubits=n_qubits_ffn,
@@ -374,7 +472,8 @@ class VisionTransformer(nn.Module):
                  embed_dim=16, num_heads=2, num_blocks=2,num_quantum_blocks =2, num_classes=10,
                  ffn_dim=32,
                  n_qubits_transformer=0, n_qubits_ffn=0, n_qlayers=1,
-                 dropout=0.0, q_device="default.qubit"):
+                 dropout=0.0, q_device="default.qubit",
+                 attn_type="classical", performer_num_features=64, performer_redraw_features=False):
         super().__init__()
         # Embedding layers
         assert image_size % patch_size == 0, "Image size must be divisible by patch size"
@@ -395,7 +494,18 @@ class VisionTransformer(nn.Module):
             # For quantum mode, ensure dimensions match
             assert embed_dim == n_qubits_transformer, "embed_dim must equal n_qubits_transformer in quantum mode"
             blocks_classical = [
-                ViTBlockClassical(embed_dim, num_heads, ffn_dim, dropout=dropout, n_qlayers=n_qlayers, n_qubits_ffn=n_qubits_ffn, q_device=q_device)
+                ViTBlockClassical(
+                    embed_dim,
+                    num_heads,
+                    ffn_dim,
+                    dropout=dropout,
+                    n_qlayers=n_qlayers,
+                    n_qubits_ffn=n_qubits_ffn,
+                    q_device=q_device,
+                    attn_type=attn_type,
+                    performer_num_features=performer_num_features,
+                    performer_redraw_features=performer_redraw_features,
+                )                
                 for _ in range(num_blocks - num_quantum_blocks)
             ]
             blocks_quantum = [
@@ -408,7 +518,18 @@ class VisionTransformer(nn.Module):
             blocks = blocks_classical + blocks_quantum
         else:
             blocks = [
-                ViTBlockClassical(embed_dim, num_heads, ffn_dim, dropout=dropout, n_qlayers=n_qlayers, n_qubits_ffn=n_qubits_ffn, q_device=q_device)
+                ViTBlockClassical(
+                    embed_dim,
+                    num_heads,
+                    ffn_dim,
+                    dropout=dropout,
+                    n_qlayers=n_qlayers,
+                    n_qubits_ffn=n_qubits_ffn,
+                    q_device=q_device,
+                    attn_type=attn_type,
+                    performer_num_features=performer_num_features,
+                    performer_redraw_features=performer_redraw_features,
+                )                
                 for _ in range(num_blocks)
             ]#:contentReference[oaicite:49]{index=49}
         self.transformers = nn.Sequential(*blocks)
