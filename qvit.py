@@ -226,6 +226,183 @@ class MultiHeadAttentionPerformer(MultiHeadAttentionBase):
         return self.combine_heads(context)
 
 
+class MultiHeadAttentionLinformer(MultiHeadAttentionBase):
+    """
+    Linformer-style self-attention that projects keys/values along sequence length.
+    This reduces attention complexity from O(N^2) to O(Nk).
+    """
+
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        max_seq_len,
+        proj_k=64,
+        dropout=0.0,
+        mask=None,
+        use_bias=False,
+    ):
+        super().__init__(embed_dim, num_heads, dropout, mask, use_bias)
+        self.q_linear = nn.Linear(embed_dim, embed_dim, bias=use_bias)
+        self.k_linear = nn.Linear(embed_dim, embed_dim, bias=use_bias)
+        self.v_linear = nn.Linear(embed_dim, embed_dim, bias=use_bias)
+        self.combine_heads = nn.Linear(embed_dim, embed_dim, bias=use_bias)
+
+        self.max_seq_len = max_seq_len
+        self.proj_k = proj_k
+        # Shared projections across heads: E and F matrices in Linformer.
+        self.E = nn.Parameter(torch.randn(max_seq_len, proj_k) * 0.02)
+        self.F = nn.Parameter(torch.randn(max_seq_len, proj_k) * 0.02)
+
+    def _project_seq(self, x, proj):
+        # x: (batch, heads, seq_len, d_k)
+        # proj: (seq_len, proj_k)
+        return torch.einsum("bhsd,sk->bhkd", x, proj)
+
+    def forward(self, x, mask=None):
+        batch_size, seq_len, embed_dim = x.size()
+        assert embed_dim == self.embed_dim
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"Input seq_len ({seq_len}) exceeds Linformer max_seq_len ({self.max_seq_len})."
+            )
+
+        Q = self.separate_heads(self.q_linear(x))
+        K = self.separate_heads(self.k_linear(x))
+        V = self.separate_heads(self.v_linear(x))
+
+        e = self.E[:seq_len, :]
+        f = self.F[:seq_len, :]
+        K_proj = self._project_seq(K, e)
+        V_proj = self._project_seq(V, f)
+
+        # Q: (B,H,S,D), K_proj: (B,H,K,D), V_proj: (B,H,K,D)
+        scores = torch.matmul(Q, K_proj.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask.unsqueeze(1).unsqueeze(2) == 0, -1e9)
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        context = torch.matmul(attn, V_proj)
+
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
+        return self.combine_heads(context)
+
+
+def _is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1) == 0)
+
+
+class SASQuaTChTokenMixer(nn.Module):
+    """
+    SASQuaTCh-inspired token mixer:
+      1) token-wise amplitude embedding + QFT
+      2) global StronglyEntanglingLayers over all token-qubits
+      3) token-wise inverse QFT
+      4) qubit readout -> token embedding projection
+
+    This block is intended for small sequence lengths due to qubit scaling.
+    """
+
+    def __init__(self, embed_dim, max_seq_len, n_qlayers=1, q_device="default.qubit"):
+        super().__init__()
+        if not _is_power_of_two(embed_dim):
+            raise ValueError(
+                f"SASQuaTCh requires embed_dim to be a power of two for amplitude embedding, got {embed_dim}."
+            )
+        self.embed_dim = embed_dim
+        self.max_seq_len = max_seq_len
+        self.token_qubits = int(math.log2(embed_dim))
+        self.data_qubits = self.max_seq_len * self.token_qubits
+
+        if 'qulacs' in q_device:
+            self.dev = qml.device(q_device, wires=self.data_qubits, shots=None, gpu=True)
+        elif 'braket' in q_device:
+            self.dev = qml.device(q_device, wires=self.data_qubits, shots=None, parallel=True)
+        elif q_device == 'lightning.gpu':
+            self.dev = qml.device(q_device, wires=self.data_qubits, shots=None)
+        else:
+            self.dev = qml.device(q_device, wires=self.data_qubits, shots=None)
+
+        def circuit(inputs, weights):
+            tokens = qml.math.reshape(inputs, (self.max_seq_len, self.embed_dim))
+            for t in range(self.max_seq_len):
+                start = t * self.token_qubits
+                wires = list(range(start, start + self.token_qubits))
+                qml.AmplitudeEmbedding(tokens[t], wires=wires, normalize=False, pad_with=0.0)
+                qml.QFT(wires=wires)
+
+            qml.StronglyEntanglingLayers(weights, wires=list(range(self.data_qubits)))
+
+            for t in range(self.max_seq_len):
+                start = t * self.token_qubits
+                wires = list(range(start, start + self.token_qubits))
+                qml.adjoint(qml.QFT)(wires=wires)
+
+            return [qml.expval(qml.PauliZ(i)) for i in range(self.data_qubits)]
+
+        self.qlayer = qml.QNode(circuit, self.dev, interface="torch", diff_method="adjoint")
+        self.weight_shapes = {"weights": (n_qlayers, self.data_qubits, 3)}
+        self.mixer = qml.qnn.TorchLayer(self.qlayer, self.weight_shapes)
+        self.out_proj = nn.Linear(self.token_qubits, embed_dim)
+
+    def _eval_q_layer_single(self, layer, x2d: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate TorchLayer with batched inputs when available.
+        If backend/qnode shape handling does not support batched execution,
+        fall back to per-sample execution.
+        """
+        try:
+            y = layer(x2d)
+            if isinstance(y, (list, tuple)):
+                y = torch.stack([torch.as_tensor(t) for t in y], dim=0)
+            return torch.as_tensor(y, dtype=x2d.dtype, device=x2d.device)
+        except RuntimeError:
+            ys = []
+            for i in range(x2d.shape[0]):
+                yi = layer(x2d[i])
+                ys.append(torch.as_tensor(yi, dtype=x2d.dtype, device=x2d.device))
+            return torch.stack(ys, dim=0)
+
+    def _normalize_tokens(self, x):
+        # x: (B,S,E) -> normalize each token for amplitude embedding.
+        norm = torch.norm(x, dim=-1, keepdim=True)
+        safe = norm > 1e-12
+        x_norm = x / torch.clamp(norm, min=1e-12)
+        default_state = torch.zeros_like(x_norm)
+        default_state[..., 0] = 1.0
+        return torch.where(safe, x_norm, default_state)
+
+    def forward(self, x):
+        B, S, E = x.shape
+        if E != self.embed_dim:
+            raise ValueError(f"SASQuaTCh embed_dim mismatch: expected {self.embed_dim}, got {E}.")
+        if S > self.max_seq_len:
+            raise ValueError(
+                f"Input seq_len ({S}) exceeds SASQuaTCh max_seq_len ({self.max_seq_len})."
+            )
+
+        model_dev = x.device
+        cpu = torch.device("cpu")
+        x_norm = self._normalize_tokens(x)
+
+        with Timer("SASQ::pre_move", PROFILE_QVIT):
+            x_cpu = x_norm.to(cpu)
+            if S < self.max_seq_len:
+                pad = torch.zeros(B, self.max_seq_len - S, E, dtype=x_cpu.dtype, device=cpu)
+                pad[..., 0] = 1.0
+                x_cpu = torch.cat([x_cpu, pad], dim=1)
+            x_flat = x_cpu.reshape(B, self.max_seq_len * E)
+
+        with Timer("SASQ::mixer", PROFILE_QVIT):
+            z_cpu = self._eval_q_layer_single(self.mixer, x_flat)
+
+        with Timer("SASQ::post", PROFILE_QVIT):
+            z = z_cpu.view(B, self.max_seq_len, self.token_qubits)[:, :S, :].to(model_dev)
+            out = self.out_proj(z)
+        return out
+
+
+
 class MultiHeadAttentionQuantum(MultiHeadAttentionBase):
     def __init__(self, embed_dim, num_heads, dropout=0.0, mask=None, use_bias=False,
                  n_qubits=4, n_qlayers=1, q_device="default.qubit"):
@@ -430,6 +607,9 @@ class ViTBlockClassical(ViTBlockBase):
         attn_type="classical",
         performer_num_features=64,
         performer_redraw_features=False,
+        linformer_k=64,
+        linformer_max_seq_len=197,
+        sasquatch_max_seq_len=197,
     ):
         super().__init__(embed_dim, num_heads, ffn_dim, dropout)
         # Classical attention and FFN
@@ -441,6 +621,14 @@ class ViTBlockClassical(ViTBlockBase):
                 num_features=performer_num_features,
                 redraw_features=performer_redraw_features,
             )
+        elif attn_type == "linformer":
+            self.attn = MultiHeadAttentionLinformer(
+                embed_dim,
+                num_heads,
+                max_seq_len=linformer_max_seq_len,
+                proj_k=linformer_k,
+                dropout=dropout,
+            )
         else:
             self.attn = MultiHeadAttentionClassical(embed_dim, num_heads, dropout=dropout)        
         # Quantum or classical FFN depending on n_qubits_ffn
@@ -449,6 +637,38 @@ class ViTBlockClassical(ViTBlockBase):
                                           n_qlayers=n_qlayers, dropout=dropout, q_device=q_device)
         else:
             self.ffn = FeedForwardClassical(embed_dim, ffn_dim, dropout=dropout)
+
+
+class ViTBlockSASQuaTCh(ViTBlockBase):
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        ffn_dim,
+        n_qlayers,
+        n_qubits_ffn,
+        q_device,
+        sasquatch_max_seq_len,
+        dropout=0.0,
+    ):
+        super().__init__(embed_dim, num_heads, ffn_dim, dropout)
+        self.attn = SASQuaTChTokenMixer(
+            embed_dim=embed_dim,
+            max_seq_len=sasquatch_max_seq_len,
+            n_qlayers=n_qlayers,
+            q_device=q_device,
+        )
+        if n_qubits_ffn > 0:
+            self.ffn = FeedForwardQuantum(
+                embed_dim,
+                n_qubits=n_qubits_ffn,
+                n_qlayers=n_qlayers,
+                dropout=dropout,
+                q_device=q_device,
+            )
+        else:
+            self.ffn = FeedForwardClassical(embed_dim, ffn_dim, dropout=dropout)
+
 
 class ViTBlockQuantum(ViTBlockBase):
     def __init__(self, embed_dim, num_heads, ffn_dim,
@@ -473,12 +693,18 @@ class VisionTransformer(nn.Module):
                  ffn_dim=32,
                  n_qubits_transformer=0, n_qubits_ffn=0, n_qlayers=1,
                  dropout=0.0, q_device="default.qubit",
-                 attn_type="classical", performer_num_features=64, performer_redraw_features=False):
+                 attn_type="classical", performer_num_features=64, performer_redraw_features=False,
+                 linformer_k=64, linformer_max_seq_len=None,
+                 sasquatch_max_seq_len=None):
         super().__init__()
         # Embedding layers
         assert image_size % patch_size == 0, "Image size must be divisible by patch size"
         
         n_patches = (image_size // patch_size) ** 2
+        if linformer_max_seq_len is None:
+            linformer_max_seq_len = n_patches + 1
+        if sasquatch_max_seq_len is None:
+            sasquatch_max_seq_len = n_patches + 1
         self.patch_embed = PatchEmbedding(image_size, patch_size, in_channels, embed_dim)
         self.embed = AddClsPos(n_patches, embed_dim)
         # Configure transformer blocks (quantum or classical)
@@ -493,8 +719,9 @@ class VisionTransformer(nn.Module):
             print(f"++ Quantum device: {q_device}")
             # For quantum mode, ensure dimensions match
             assert embed_dim == n_qubits_transformer, "embed_dim must equal n_qubits_transformer in quantum mode"
+            classical_block_cls = ViTBlockSASQuaTCh if attn_type == "sasquatch" else ViTBlockClassical
             blocks_classical = [
-                ViTBlockClassical(
+                classical_block_cls(
                     embed_dim,
                     num_heads,
                     ffn_dim,
@@ -505,7 +732,19 @@ class VisionTransformer(nn.Module):
                     attn_type=attn_type,
                     performer_num_features=performer_num_features,
                     performer_redraw_features=performer_redraw_features,
-                )                
+                    linformer_k=linformer_k,
+                    linformer_max_seq_len=linformer_max_seq_len,
+                    sasquatch_max_seq_len=sasquatch_max_seq_len,
+                ) if classical_block_cls is ViTBlockClassical else classical_block_cls(
+                    embed_dim,
+                    num_heads,
+                    ffn_dim,
+                    n_qlayers=n_qlayers,
+                    n_qubits_ffn=n_qubits_ffn,
+                    q_device=q_device,
+                    sasquatch_max_seq_len=sasquatch_max_seq_len,
+                    dropout=dropout,
+                )
                 for _ in range(num_blocks - num_quantum_blocks)
             ]
             blocks_quantum = [
@@ -517,8 +756,9 @@ class VisionTransformer(nn.Module):
             ]#:contentReference[oaicite:48]{index=48}
             blocks = blocks_classical + blocks_quantum
         else:
+            classical_block_cls = ViTBlockSASQuaTCh if attn_type == "sasquatch" else ViTBlockClassical
             blocks = [
-                ViTBlockClassical(
+                classical_block_cls(
                     embed_dim,
                     num_heads,
                     ffn_dim,
@@ -529,7 +769,19 @@ class VisionTransformer(nn.Module):
                     attn_type=attn_type,
                     performer_num_features=performer_num_features,
                     performer_redraw_features=performer_redraw_features,
-                )                
+                    linformer_k=linformer_k,
+                    linformer_max_seq_len=linformer_max_seq_len,
+                    sasquatch_max_seq_len=sasquatch_max_seq_len,
+                ) if classical_block_cls is ViTBlockClassical else classical_block_cls(
+                    embed_dim,
+                    num_heads,
+                    ffn_dim,
+                    n_qlayers=n_qlayers,
+                    n_qubits_ffn=n_qubits_ffn,
+                    q_device=q_device,
+                    sasquatch_max_seq_len=sasquatch_max_seq_len,
+                    dropout=dropout,
+                )
                 for _ in range(num_blocks)
             ]#:contentReference[oaicite:49]{index=49}
         self.transformers = nn.Sequential(*blocks)
@@ -549,4 +801,3 @@ class VisionTransformer(nn.Module):
         x = self.dropout(x)
         logits = self.classifier(x)    # (batch, num_classes) or (batch, 1)
         return logits
-
