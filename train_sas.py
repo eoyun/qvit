@@ -201,7 +201,12 @@ model = VisionTransformer(
     attn_type=attn_type,
     performer_num_features=performer_num_features,
     performer_redraw_features=performer_redraw_features,
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
+    sasquatch_max_seq_len=sasquatch_max_seq_len,
+    sasquatch_max_qubits=sasquatch_max_qubits
+=======
     sasquatch_max_seq_len=sasquatch_max_seq_len
+>>>>>>> uv_env
 )
 print(model)
 model.to(device)
@@ -364,7 +369,12 @@ best_model = VisionTransformer(
     attn_type=attn_type,
     performer_num_features=performer_num_features,
     performer_redraw_features=performer_redraw_features,
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
+    sasquatch_max_seq_len=sasquatch_max_seq_len,
+    sasquatch_max_qubits=sasquatch_max_qubits
+=======
     sasquatch_max_seq_len=sasquatch_max_seq_len
+>>>>>>> uv_env
 )
 best_model.load_state_dict(ckpt["model_state_dict"])
 best_model.to(device)
