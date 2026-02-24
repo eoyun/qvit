@@ -345,6 +345,24 @@ class SASQuaTChTokenMixer(nn.Module):
         self.mixer = qml.qnn.TorchLayer(self.qlayer, self.weight_shapes)
         self.out_proj = nn.Linear(self.token_qubits, embed_dim)
 
+    def _eval_q_layer_single(self, layer, x2d: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate TorchLayer with batched inputs when available.
+        If backend/qnode shape handling does not support batched execution,
+        fall back to per-sample execution.
+        """
+        try:
+            y = layer(x2d)
+            if isinstance(y, (list, tuple)):
+                y = torch.stack([torch.as_tensor(t) for t in y], dim=0)
+            return torch.as_tensor(y, dtype=x2d.dtype, device=x2d.device)
+        except RuntimeError:
+            ys = []
+            for i in range(x2d.shape[0]):
+                yi = layer(x2d[i])
+                ys.append(torch.as_tensor(yi, dtype=x2d.dtype, device=x2d.device))
+            return torch.stack(ys, dim=0)
+
     def _normalize_tokens(self, x):
         # x: (B,S,E) -> normalize each token for amplitude embedding.
         norm = torch.norm(x, dim=-1, keepdim=True)
@@ -376,7 +394,7 @@ class SASQuaTChTokenMixer(nn.Module):
             x_flat = x_cpu.reshape(B, self.max_seq_len * E)
 
         with Timer("SASQ::mixer", PROFILE_QVIT):
-            z_cpu = self.mixer(x_flat)
+            z_cpu = self._eval_q_layer_single(self.mixer, x_flat)
 
         with Timer("SASQ::post", PROFILE_QVIT):
             z = z_cpu.view(B, self.max_seq_len, self.token_qubits)[:, :S, :].to(model_dev)
