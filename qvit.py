@@ -303,6 +303,7 @@ class SASQuaTChTokenMixer(nn.Module):
     This block is intended for small sequence lengths due to qubit scaling.
     """
 
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
     def __init__(
         self,
         embed_dim,
@@ -311,6 +312,9 @@ class SASQuaTChTokenMixer(nn.Module):
         q_device="default.qubit",
         max_qubits=24,
     ):
+=======
+    def __init__(self, embed_dim, max_seq_len, n_qlayers=1, q_device="default.qubit"):
+>>>>>>> uv_env
         super().__init__()
         if not _is_power_of_two(embed_dim):
             raise ValueError(
@@ -319,10 +323,14 @@ class SASQuaTChTokenMixer(nn.Module):
         self.embed_dim = embed_dim
         self.max_seq_len = max_seq_len
         self.token_qubits = int(math.log2(embed_dim))
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
         self.max_qubits = max_qubits
         # Keep quantum register size bounded by max_qubits.
         self.chunk_tokens = max(1, min(self.max_seq_len, self.max_qubits // self.token_qubits))
         self.data_qubits = self.chunk_tokens * self.token_qubits
+=======
+        self.data_qubits = self.max_seq_len * self.token_qubits
+>>>>>>> uv_env
 
         if 'qulacs' in q_device:
             self.dev = qml.device(q_device, wires=self.data_qubits, shots=None, gpu=True)
@@ -334,8 +342,13 @@ class SASQuaTChTokenMixer(nn.Module):
             self.dev = qml.device(q_device, wires=self.data_qubits, shots=None)
 
         def circuit(inputs, weights):
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
             tokens = qml.math.reshape(inputs, (self.chunk_tokens, self.embed_dim))
             for t in range(self.chunk_tokens):
+=======
+            tokens = qml.math.reshape(inputs, (self.max_seq_len, self.embed_dim))
+            for t in range(self.max_seq_len):
+>>>>>>> uv_env
                 start = t * self.token_qubits
                 wires = list(range(start, start + self.token_qubits))
                 qml.AmplitudeEmbedding(tokens[t], wires=wires, normalize=False, pad_with=0.0)
@@ -343,7 +356,11 @@ class SASQuaTChTokenMixer(nn.Module):
 
             qml.StronglyEntanglingLayers(weights, wires=list(range(self.data_qubits)))
 
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
             for t in range(self.chunk_tokens):
+=======
+            for t in range(self.max_seq_len):
+>>>>>>> uv_env
                 start = t * self.token_qubits
                 wires = list(range(start, start + self.token_qubits))
                 qml.adjoint(qml.QFT)(wires=wires)
@@ -401,6 +418,7 @@ class SASQuaTChTokenMixer(nn.Module):
                 pad = torch.zeros(B, self.max_seq_len - S, E, dtype=x_cpu.dtype, device=cpu)
                 pad[..., 0] = 1.0
                 x_cpu = torch.cat([x_cpu, pad], dim=1)
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
 
             # chunk tokens to keep qubit count bounded
             n_chunks = (self.max_seq_len + self.chunk_tokens - 1) // self.chunk_tokens
@@ -412,14 +430,21 @@ class SASQuaTChTokenMixer(nn.Module):
 
             x_chunks = x_cpu.view(B, n_chunks, self.chunk_tokens, E)
             x_flat = x_chunks.reshape(B * n_chunks, self.chunk_tokens * E)
+=======
+            x_flat = x_cpu.reshape(B, self.max_seq_len * E)
+>>>>>>> uv_env
 
         with Timer("SASQ::mixer", PROFILE_QVIT):
             z_cpu = self._eval_q_layer_single(self.mixer, x_flat)
 
         with Timer("SASQ::post", PROFILE_QVIT):
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
             z = z_cpu.view(B, n_chunks, self.chunk_tokens, self.token_qubits)
             z = z.view(B, n_chunks * self.chunk_tokens, self.token_qubits)
             z = z[:, :S, :].to(model_dev)
+=======
+            z = z_cpu.view(B, self.max_seq_len, self.token_qubits)[:, :S, :].to(model_dev)
+>>>>>>> uv_env
             out = self.out_proj(z)
         return out
 
@@ -671,7 +696,10 @@ class ViTBlockSASQuaTCh(ViTBlockBase):
         n_qubits_ffn,
         q_device,
         sasquatch_max_seq_len,
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
         sasquatch_max_qubits,
+=======
+>>>>>>> uv_env
         dropout=0.0,
     ):
         super().__init__(embed_dim, num_heads, ffn_dim, dropout)
@@ -680,7 +708,10 @@ class ViTBlockSASQuaTCh(ViTBlockBase):
             max_seq_len=sasquatch_max_seq_len,
             n_qlayers=n_qlayers,
             q_device=q_device,
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
             max_qubits=sasquatch_max_qubits,
+=======
+>>>>>>> uv_env
         )
         if n_qubits_ffn > 0:
             self.ffn = FeedForwardQuantum(
@@ -719,8 +750,12 @@ class VisionTransformer(nn.Module):
                  dropout=0.0, q_device="default.qubit",
                  attn_type="classical", performer_num_features=64, performer_redraw_features=False,
                  linformer_k=64, linformer_max_seq_len=None,
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
                  sasquatch_max_seq_len=None,
                  sasquatch_max_qubits=24):
+=======
+                 sasquatch_max_seq_len=None):
+>>>>>>> uv_env
         super().__init__()
         # Embedding layers
         assert image_size % patch_size == 0, "Image size must be divisible by patch size"
@@ -768,7 +803,10 @@ class VisionTransformer(nn.Module):
                     n_qubits_ffn=n_qubits_ffn,
                     q_device=q_device,
                     sasquatch_max_seq_len=sasquatch_max_seq_len,
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
                     sasquatch_max_qubits=sasquatch_max_qubits,
+=======
+>>>>>>> uv_env
                     dropout=dropout,
                 )
                 for _ in range(num_blocks - num_quantum_blocks)
@@ -806,7 +844,10 @@ class VisionTransformer(nn.Module):
                     n_qubits_ffn=n_qubits_ffn,
                     q_device=q_device,
                     sasquatch_max_seq_len=sasquatch_max_seq_len,
+<<<<<<< codex/add-model-from-arxiv-2403.14753-to-qvit.py-psk65b
                     sasquatch_max_qubits=sasquatch_max_qubits,
+=======
+>>>>>>> uv_env
                     dropout=dropout,
                 )
                 for _ in range(num_blocks)
